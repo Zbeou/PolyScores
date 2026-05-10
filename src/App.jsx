@@ -11,15 +11,20 @@ async function api(path, params = {}) {
     ? `/api/proxy?path=${encodeURIComponent(path)}${qs ? "&" + qs : ""}`
     : `https://gamma-api.polymarket.com${path}${qs ? "?" + qs : ""}`;
   const r = await fetch(url);
-  if (!r.ok) throw new Error(`${r.status}`);
+  if (!r.ok) throw new Error(`${r.status} on ${path}`);
   return r.json();
 }
 
-/* ─── SPORT TABS ─── */
+/* ─── SPORT TABS ──
+   trySlugs: known Polymarket tag slugs to try (in order). First match wins.
+*/
 const TABS = [
-  { id: "basketball", label: "🏀 NBA", icon: "🏀", sportKey: "basketball" },
-  { id: "soccer",     label: "⚽ Football", icon: "⚽", sportKey: "soccer" },
-  { id: "tennis",     label: "🎾 Tennis", icon: "🎾", sportKey: "tennis" },
+  { id: "basketball", label: "🏀 NBA", icon: "🏀",
+    trySlugs: ["nba", "basketball", "nba-finals", "nba-playoffs"] },
+  { id: "soccer", label: "⚽ Football", icon: "⚽",
+    trySlugs: ["fifa-world-cup-2026", "fifa-world-cup", "soccer", "football", "world-cup"] },
+  { id: "tennis", label: "🎾 Tennis", icon: "🎾",
+    trySlugs: ["tennis", "atp", "wta", "roland-garros", "wimbledon"] },
 ];
 
 /* ─── HELPERS ─── */
@@ -33,7 +38,6 @@ const fv = (v) => {
   return n >= 1e6 ? `$${(n / 1e6).toFixed(1)}M` : n >= 1e3 ? `$${(n / 1e3).toFixed(0)}K` : `$${n.toFixed(0)}`;
 };
 
-/* Build array of dates: yesterday + today + 6 future days */
 function buildDates() {
   const dates = [];
   const now = new Date();
@@ -73,43 +77,40 @@ function parseEvents(rawEvents) {
     const slug = ev.slug || "";
     const vs = title.match(/^(.+?)\s+(?:vs\.?|v\.?)\s+(.+?)$/i);
 
-    // Find the game start time from the first market that has one
     let startTime = null;
     for (const m of markets) {
       const t = m.gameStartTime || m.eventStartTime || null;
       if (t) { startTime = new Date(t); break; }
     }
     if (!startTime && ev.startTime) startTime = new Date(ev.startTime);
+    if (!startTime && ev.startDate) startTime = new Date(ev.startDate);
 
-    // Group markets by sportsMarketType
     const moneyline = markets.find((m) => m.sportsMarketType === "moneyline" || (!m.sportsMarketType && vs));
-    const spread = markets.filter((m) => m.sportsMarketType === "spread");
-    const total = markets.filter((m) => m.sportsMarketType === "total");
 
-    // Parse outcomes from moneyline or first market
     let outcomes = [];
     const src = moneyline || markets[0];
     if (src) {
-      const prices = src.outcomePrices ? JSON.parse(src.outcomePrices) : [];
-      const labels = src.outcomes ? JSON.parse(src.outcomes) : [];
-      outcomes = labels.map((l, i) => ({ label: l, prob: parseFloat(prices[i] || 0) }));
+      try {
+        const prices = src.outcomePrices ? JSON.parse(src.outcomePrices) : [];
+        const labels = src.outcomes ? JSON.parse(src.outcomes) : [];
+        outcomes = labels.map((l, i) => ({ label: l, prob: parseFloat(prices[i] || 0) }));
+      } catch (_) {}
     }
 
-    // If multi-market event (e.g. tournament winner), parse differently
     if (!vs && markets.length > 1) {
       outcomes = markets.filter((m) => m.outcomePrices).map((m) => {
-        const p = JSON.parse(m.outcomePrices);
-        const l = m.outcomes ? JSON.parse(m.outcomes) : [];
-        return { label: l[0] || m.groupItemTitle || "?", prob: parseFloat(p[0] || 0) };
-      }).sort((a, b) => b.prob - a.prob);
+        try {
+          const p = JSON.parse(m.outcomePrices);
+          const l = m.outcomes ? JSON.parse(m.outcomes) : [];
+          return { label: l[0] || m.groupItemTitle || "?", prob: parseFloat(p[0] || 0) };
+        } catch { return null; }
+      }).filter(Boolean).sort((a, b) => b.prob - a.prob);
     }
 
     if (!outcomes.length) continue;
 
     games.push({
-      id: ev.id,
-      title,
-      slug,
+      id: ev.id, title, slug,
       isMatch: !!vs,
       team1: vs ? vs[1].trim() : null,
       team2: vs ? vs[2].trim() : null,
@@ -117,26 +118,19 @@ function parseEvents(rawEvents) {
       volume: ev.volume || 0,
       startTime,
       url: link(slug),
-      hasSpread: spread.length > 0,
-      hasTotal: total.length > 0,
-      seriesSlug: ev.seriesSlug || "",
     });
   }
-
   return games;
 }
 
 /* ─── COMPONENTS ─── */
 
-/* Date picker */
 function DateBar({ dates, selected, onSelect }) {
   const ref = useRef(null);
   useEffect(() => {
-    // scroll to today on mount
     const el = ref.current?.querySelector(".dp-a");
     if (el) el.scrollIntoView({ inline: "center", block: "nearest" });
   }, []);
-
   return (
     <div className="dp" ref={ref}>
       {dates.map((d, i) => {
@@ -152,7 +146,6 @@ function DateBar({ dates, selected, onSelect }) {
   );
 }
 
-/* Odds badge */
 function OB({ label, prob, fmt, fav }) {
   const v = fmt === "decimal" ? d2o(prob) : d2us(prob);
   return (
@@ -164,11 +157,8 @@ function OB({ label, prob, fmt, fav }) {
   );
 }
 
-/* Match row */
 function GameRow({ g, fmt }) {
   const [exp, setExp] = useState(false);
-
-  // Format game time in local timezone
   const timeStr = g.startTime
     ? g.startTime.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })
     : "";
@@ -177,10 +167,9 @@ function GameRow({ g, fmt }) {
     const t1 = g.outcomes[0]?.prob || 0;
     const t2 = g.outcomes[1]?.prob || 0;
     const draw = g.outcomes[2]?.prob || null;
-
     return (
       <a href={g.url} target="_blank" rel="noopener noreferrer" className="mr">
-        <div className="mr-time">{timeStr}</div>
+        <div className="mr-time">{timeStr || "—"}</div>
         <div className="mr-teams">
           <span className="mr-tn" style={{ fontWeight: t1 >= t2 ? 700 : 400, color: t1 >= t2 ? "#fff" : "#8896a8" }}>{g.team1}</span>
           <span className="mr-tn" style={{ fontWeight: t2 > t1 ? 700 : 400, color: t2 > t1 ? "#fff" : "#8896a8" }}>{g.team2}</span>
@@ -195,7 +184,6 @@ function GameRow({ g, fmt }) {
     );
   }
 
-  // Outright / future
   const shown = exp ? g.outcomes : g.outcomes.slice(0, 5);
   return (
     <div className="out">
@@ -231,76 +219,59 @@ function GameRow({ g, fmt }) {
 export default function App() {
   const [tab, setTab] = useState("basketball");
   const [fmt, setFmt] = useState("decimal");
-  const [tagMap, setTagMap] = useState(null); // sport -> [tagId, ...]
-  const [events, setEvents] = useState({}); // tab -> parsed games
+  const [events, setEvents] = useState({});
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState(null);
+  const [debug, setDebug] = useState({});
   const [selDate, setSelDate] = useState(() => { const d = new Date(); d.setHours(0,0,0,0); return d; });
   const dates = useMemo(buildDates, []);
 
-  // Step 1: discover tag IDs via /sports
-  useEffect(() => {
-    (async () => {
-      try {
-        const sports = await api("/sports");
-        const map = {};
-        for (const s of sports) {
-          const key = (s.sport || "").toLowerCase();
-          const ids = (s.tags || "").split(",").map((t) => t.trim()).filter(Boolean);
-          if (key && ids.length) map[key] = ids;
-        }
-        setTagMap(map);
-      } catch (e) {
-        console.error("Failed to load /sports:", e);
-        // Fallback hardcoded tag IDs (may need updating)
-        setTagMap({
-          basketball: ["102"],
-          soccer: ["101"],
-          tennis: ["103"],
-        });
-      }
-    })();
-  }, []);
-
-  // Step 2: fetch events for selected sport
   const loadSport = useCallback(async (sportId) => {
-    if (!tagMap) return;
-    setLoading(true);
-    setError(null);
-
+    setLoading(true); setError(null);
     const cfg = TABS.find((t) => t.id === sportId);
     if (!cfg) return;
 
-    const ids = tagMap[cfg.sportKey] || [];
-    if (!ids.length) {
-      setError("No tag IDs found for this sport. Check /sports metadata.");
-      setLoading(false);
-      return;
-    }
+    const debugInfo = { triedSlugs: [], successSlug: null, eventCount: 0 };
 
     try {
-      const all = [];
+      let rawEvents = [];
       const seen = new Set();
 
-      for (const tagId of ids) {
+      // Try each slug until we get events
+      for (const slug of cfg.trySlugs) {
+        debugInfo.triedSlugs.push(slug);
         try {
           const data = await api("/events", {
-            tag_id: tagId,
+            tag_slug: slug,
+            related_tags: "true",
             active: "true",
             closed: "false",
-            limit: "100",
+            limit: "200",
             order: "volume_24hr",
             ascending: "false",
           });
-          for (const ev of data) {
-            if (!seen.has(ev.id)) { seen.add(ev.id); all.push(ev); }
+          if (Array.isArray(data) && data.length > 0) {
+            for (const ev of data) {
+              if (!seen.has(ev.id)) { seen.add(ev.id); rawEvents.push(ev); }
+            }
+            if (!debugInfo.successSlug) debugInfo.successSlug = slug;
           }
-        } catch (_) {}
+        } catch (e) {
+          debugInfo[`err_${slug}`] = e.message;
+        }
       }
 
-      const parsed = parseEvents(all);
+      debugInfo.eventCount = rawEvents.length;
+      setDebug((prev) => ({ ...prev, [sportId]: debugInfo }));
+
+      if (rawEvents.length === 0) {
+        setError(`No events returned for ${cfg.label}. Tried slugs: ${debugInfo.triedSlugs.join(", ")}`);
+        setEvents((p) => ({ ...p, [sportId]: [] }));
+        return;
+      }
+
+      const parsed = parseEvents(rawEvents);
       parsed.sort((a, b) => {
-        // Sort by startTime first (nulls at end), then by volume
         if (a.startTime && b.startTime) return a.startTime - b.startTime;
         if (a.startTime) return -1;
         if (b.startTime) return 1;
@@ -313,27 +284,26 @@ export default function App() {
     } finally {
       setLoading(false);
     }
-  }, [tagMap]);
+  }, []);
 
   useEffect(() => {
-    if (tagMap) loadSport(tab);
-  }, [tab, tagMap, loadSport]);
+    loadSport(tab);
+  }, [tab, loadSport]);
 
-  // Filter events by selected date
   const filtered = useMemo(() => {
     const all = events[tab] || [];
     const withDate = all.filter((g) => g.startTime && sameDay(g.startTime, selDate));
-    const futures = all.filter((g) => !g.startTime && !g.isMatch); // outrights have no date
+    const futures = all.filter((g) => !g.startTime && !g.isMatch);
     return { matches: withDate, futures };
   }, [events, tab, selDate]);
 
   const totalForDate = filtered.matches.length;
+  const showDebug = typeof window !== "undefined" && localStorage.getItem("debug");
 
   return (
     <>
       <style>{CSS}</style>
       <div className="app">
-        {/* Header */}
         <header className="hdr">
           <div className="hdr-l">
             <span style={{ fontSize: 22 }}>📊</span>
@@ -349,7 +319,6 @@ export default function App() {
           </div>
         </header>
 
-        {/* Sport tabs */}
         <nav className="tabs">
           {TABS.map((t) => (
             <button key={t.id} className={`tab${tab === t.id ? " tab-a" : ""}`} onClick={() => setTab(t.id)}>
@@ -358,28 +327,29 @@ export default function App() {
           ))}
         </nav>
 
-        {/* Date picker */}
         <DateBar dates={dates} selected={selDate} onSelect={setSelDate} />
 
-        {/* Content */}
         <main className="ct">
           {loading && (
             <div className="st"><div className="sp" /><span>Loading…</span></div>
           )}
 
           {error && (
-            <div className="st err">⚠️ <p>{error}</p></div>
+            <div className="st err">
+              ⚠️
+              <p>{error}</p>
+              <p style={{ fontSize: 11, color: "#64748b" }}>Open the browser console for details.</p>
+            </div>
           )}
 
           {!loading && !error && totalForDate === 0 && filtered.futures.length === 0 && (
             <div className="st">
               <span style={{ fontSize: 32 }}>{TABS.find((t) => t.id === tab)?.icon}</span>
               <p>No markets for {fmtDay(selDate).toLowerCase()}.</p>
-              <p style={{ fontSize: 12, color: "#64748b" }}>Try another date or check Futures below.</p>
+              <p style={{ fontSize: 12, color: "#64748b" }}>Total loaded: {(events[tab] || []).length} events</p>
             </div>
           )}
 
-          {/* Matches for selected date */}
           {totalForDate > 0 && (
             <section className="sec">
               <div className="sec-h">
@@ -392,7 +362,6 @@ export default function App() {
             </section>
           )}
 
-          {/* Futures / outrights (always visible) */}
           {filtered.futures.length > 0 && (
             <section className="sec">
               <div className="sec-h">
@@ -405,13 +374,20 @@ export default function App() {
             </section>
           )}
 
-          {/* Debug info (hidden in prod, toggle with localStorage) */}
-          {typeof window !== "undefined" && localStorage.getItem("debug") && tagMap && (
-            <div style={{ padding: 16, fontSize: 10, color: "#475569", wordBreak: "break-all" }}>
-              <p>Sport: {tab} → tag_ids: {JSON.stringify(tagMap[TABS.find(t=>t.id===tab)?.sportKey])}</p>
-              <p>Total events loaded: {(events[tab] || []).length}</p>
-              <p>With startTime: {(events[tab] || []).filter(g=>g.startTime).length}</p>
-              <p>Matches for date: {totalForDate}</p>
+          {showDebug && debug[tab] && (
+            <div className="dbg">
+              <div><b>DEBUG</b></div>
+              <div>Tab: {tab}</div>
+              <div>Tried slugs: {debug[tab].triedSlugs.join(", ")}</div>
+              <div>Success slug: {debug[tab].successSlug || "none"}</div>
+              <div>Raw events: {debug[tab].eventCount}</div>
+              <div>Parsed: {(events[tab] || []).length}</div>
+              <div>With startTime: {(events[tab] || []).filter(g => g.startTime).length}</div>
+              <div>Matches: {(events[tab] || []).filter(g => g.isMatch).length}</div>
+              <div>Filtered (date): {totalForDate}</div>
+              <details><summary>Sample event titles</summary>
+                {(events[tab] || []).slice(0, 10).map(g => <div key={g.id} style={{ fontSize: 10 }}>· {g.title} {g.startTime ? `(${g.startTime.toISOString()})` : "(no time)"}</div>)}
+              </details>
             </div>
           )}
         </main>
@@ -420,15 +396,11 @@ export default function App() {
   );
 }
 
-/* ─── CSS ─── */
 const CSS = `
 @import url('https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700;800&display=swap');
 *{margin:0;padding:0;box-sizing:border-box}body{background:#0f1116}
 ::-webkit-scrollbar{width:4px;height:4px}::-webkit-scrollbar-thumb{background:#1e293b;border-radius:4px}
-
 .app{font-family:'DM Sans',sans-serif;background:#0f1116;color:#e2e8f0;min-height:100vh;max-width:680px;margin:0 auto}
-
-/* Header */
 .hdr{display:flex;justify-content:space-between;align-items:center;padding:14px 16px;border-bottom:1px solid rgba(255,255,255,.06)}
 .hdr-l{display:flex;align-items:center;gap:8px}
 .hdr-r{display:flex;align-items:center;gap:8px}
@@ -439,14 +411,10 @@ const CSS = `
 .tog-a{background:rgba(34,197,94,.2);color:#22c55e}
 .ref{background:rgba(255,255,255,.06);border:none;color:#94a3b8;font-size:16px;padding:4px 8px;border-radius:6px;cursor:pointer}
 .ref:hover{color:#fff}
-
-/* Tabs */
 .tabs{display:flex;border-bottom:1px solid rgba(255,255,255,.06)}
 .tab{flex:1;background:none;border:none;border-bottom:2px solid transparent;color:#64748b;font:600 13px/1 'DM Sans',sans-serif;padding:12px 8px;cursor:pointer;transition:all .2s}
 .tab:hover{color:#94a3b8}
 .tab-a{color:#22c55e;border-bottom-color:#22c55e;background:rgba(34,197,94,.04)}
-
-/* Date picker */
 .dp{display:flex;gap:4px;padding:10px 12px;overflow-x:auto;border-bottom:1px solid rgba(255,255,255,.06);-webkit-overflow-scrolling:touch}
 .dp-b{display:flex;flex-direction:column;align-items:center;gap:2px;padding:6px 12px;border-radius:8px;border:1px solid rgba(255,255,255,.06);background:rgba(255,255,255,.02);cursor:pointer;min-width:72px;font-family:inherit;transition:all .15s}
 .dp-b:hover{background:rgba(255,255,255,.06)}
@@ -455,14 +423,10 @@ const CSS = `
 .dp-a .dp-l{color:#22c55e}
 .dp-d{font-size:16px;font-weight:700;color:#e2e8f0}
 .dp-l{font-size:9px;color:#64748b;text-transform:uppercase;letter-spacing:.5px;white-space:nowrap}
-
-/* Sections */
 .sec{margin-bottom:4px}
 .sec-h{display:flex;align-items:center;gap:8px;padding:10px 16px 6px;background:rgba(255,255,255,.015)}
 .sec-t{font-size:11px;font-weight:700;color:#64748b;letter-spacing:1px}
 .sec-c{font-size:10px;font-weight:600;color:#22c55e;background:rgba(34,197,94,.15);padding:1px 6px;border-radius:10px}
-
-/* Match row */
 .mr{display:flex;align-items:center;padding:10px 16px;gap:10px;border-bottom:1px solid rgba(255,255,255,.04);text-decoration:none;color:inherit;transition:background .15s}
 .mr:hover{background:rgba(255,255,255,.05)}
 .mr-time{font-size:11px;font-weight:600;color:#64748b;min-width:42px;text-align:center}
@@ -470,15 +434,11 @@ const CSS = `
 .mr-tn{font-size:13px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .mr-odds{display:flex;gap:5px}
 .mr-vol{font-size:10px;font-weight:600;color:#475569;min-width:40px;text-align:right}
-
-/* Odds badge */
 .ob{display:flex;flex-direction:column;align-items:center;background:rgba(255,255,255,.05);border-radius:6px;padding:5px 8px;min-width:50px;gap:1px}
 .ob-f{background:rgba(34,197,94,.1);outline:1px solid rgba(34,197,94,.2)}
 .ob-l{font-size:9px;font-weight:700;color:#64748b;letter-spacing:.5px}
 .ob-v{font-size:13px;font-weight:700;color:#fff}
 .ob-p{font-size:9px;color:#64748b}
-
-/* Outright */
 .out{border-bottom:1px solid rgba(255,255,255,.04);padding-bottom:4px}
 .out-h{display:flex;justify-content:space-between;align-items:center;padding:10px 16px 6px;text-decoration:none;color:inherit}
 .out-t{font-size:13px;font-weight:600}
@@ -493,14 +453,13 @@ const CSS = `
 .out-p{font-size:11px;color:#64748b;width:38px;text-align:right}
 .sm{background:none;border:none;color:#3b82f6;font:600 11px/1 'DM Sans',sans-serif;padding:6px 16px 10px;cursor:pointer;width:100%;text-align:left}
 .sm:hover{color:#60a5fa}
-
-/* States */
 .st{display:flex;flex-direction:column;align-items:center;gap:10px;padding:50px 24px;color:#64748b;font-size:13px;text-align:center}
 .err{color:#f59e0b}
 .st p{margin:0;line-height:1.5}
 @keyframes spin{to{transform:rotate(360deg)}}
 .sp{width:22px;height:22px;border:2px solid rgba(255,255,255,.1);border-top-color:#22c55e;border-radius:50%;animation:spin .8s linear infinite}
-
+.dbg{padding:16px;font-size:11px;color:#64748b;background:rgba(255,255,255,.02);margin-top:20px;line-height:1.6;font-family:monospace}
+.dbg b{color:#22c55e}
 @media(max-width:480px){
   .ob{min-width:42px;padding:4px 6px}.ob-v{font-size:12px}
   .mr{padding:8px 12px;gap:6px}.sub{display:none}
