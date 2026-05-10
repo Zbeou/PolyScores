@@ -1,275 +1,418 @@
-import { useState, useEffect, useCallback, useMemo } from "react";
+import { useState, useEffect, useCallback, useMemo, useRef } from "react";
 
-/* ── CONFIG ── */
-const REFERRAL_TAG = ""; // e.g. "?ref=YOUR_CODE"
-const polyLink = (slug) => `https://polymarket.com/event/${slug}${REFERRAL_TAG}`;
+/* ─── CONFIG ─── */
+const REF = ""; // your referral param, e.g. "?ref=CODE"
+const link = (slug) => `https://polymarket.com/event/${slug}${REF}`;
+const isProxy = typeof window !== "undefined" && window.location.hostname !== "localhost";
 
-const useProxy =
-  typeof window !== "undefined" && window.location.hostname !== "localhost";
-
-const gammaFetch = async (path, params = {}) => {
+async function api(path, params = {}) {
   const qs = new URLSearchParams(params).toString();
-  const url = useProxy
-    ? `/api/proxy?path=${encodeURIComponent(path)}${qs ? `&${qs}` : ""}`
-    : `https://gamma-api.polymarket.com${path}${qs ? `?${qs}` : ""}`;
+  const url = isProxy
+    ? `/api/proxy?path=${encodeURIComponent(path)}${qs ? "&" + qs : ""}`
+    : `https://gamma-api.polymarket.com${path}${qs ? "?" + qs : ""}`;
   const r = await fetch(url);
   if (!r.ok) throw new Error(`${r.status}`);
   return r.json();
-};
+}
 
-const SPORTS = [
-  {
-    id: "soccer", label: "⚽ World Cup", icon: "⚽",
-    tagSlugs: ["fifa-world-cup", "world-cup-2026", "soccer", "football"],
-    filterTerms: ["world cup","fifa","soccer","football","fc ","fc\n"," fc","united","city","real ","barcelona","premier league","la liga","serie a","bundesliga","ligue 1","champions league"],
-    grouper: (ev) => {
-      const t = ev.title;
-      if (/world cup/i.test(t)) return "🏆 FIFA World Cup 2026";
-      if (/champions league/i.test(t)) return "⭐ Champions League";
-      if (/premier league|epl/i.test(t)) return "🏴 Premier League";
-      if (/la liga/i.test(t)) return "🇪🇸 La Liga";
-      if (/serie a/i.test(t)) return "🇮🇹 Serie A";
-      if (/bundesliga/i.test(t)) return "🇩🇪 Bundesliga";
-      if (/ligue 1/i.test(t)) return "🇫🇷 Ligue 1";
-      return "⚽ Football";
-    },
-  },
-  {
-    id: "tennis", label: "🎾 Tennis", icon: "🎾",
-    tagSlugs: ["tennis","roland-garros","french-open","wimbledon","us-open","australian-open","atp","wta"],
-    filterTerms: ["tennis","roland garros","french open","wimbledon","us open","australian open","atp","wta","grand slam"],
-    grouper: (ev) => {
-      const t = (ev.title + " " + ev.seriesSlug).toLowerCase();
-      if (/roland.garros|french.open/.test(t)) return "🇫🇷 Roland Garros";
-      if (/wimbledon/.test(t)) return "🇬🇧 Wimbledon";
-      if (/us.open/.test(t)) return "🇺🇸 US Open";
-      if (/australian.open/.test(t)) return "🇦🇺 Australian Open";
-      if (/atp/.test(t)) return "🎾 ATP Tour";
-      if (/wta/.test(t)) return "🎾 WTA Tour";
-      return "🎾 Tennis";
-    },
-  },
-  {
-    id: "basketball", label: "🏀 NBA", icon: "🏀",
-    tagSlugs: ["nba","basketball","nba-finals","nba-playoffs"],
-    filterTerms: ["nba","basketball","lakers","celtics","knicks","warriors","76ers","bucks","nuggets","heat","thunder","timberwolves","cavaliers","pacers","nets","hawks","bulls","rockets","spurs","suns","clippers","mavericks","grizzlies","pelicans","kings","magic","raptors","blazers","jazz","hornets","wizards"],
-    grouper: (ev) => {
-      const t = ev.title;
-      if (/final/i.test(t)) return "🏆 NBA Finals";
-      if (/playoff/i.test(t)) return "🔥 NBA Playoffs";
-      if (/mvp|award/i.test(t)) return "⭐ NBA Awards";
-      if (/champion/i.test(t)) return "🏆 NBA Championship";
-      if (/vs\.?|v\.\s/i.test(t)) return "📅 NBA Games";
-      return "🏀 NBA";
-    },
-  },
+/* ─── SPORT TABS ─── */
+const TABS = [
+  { id: "basketball", label: "🏀 NBA", icon: "🏀", sportKey: "basketball" },
+  { id: "soccer",     label: "⚽ Football", icon: "⚽", sportKey: "soccer" },
+  { id: "tennis",     label: "🎾 Tennis", icon: "🎾", sportKey: "tennis" },
 ];
 
-/* ── HELPERS ── */
-const prob2dec = (p) => (!p || p <= 0 ? "-" : (1 / p).toFixed(2));
-const prob2us = (p) => {
+/* ─── HELPERS ─── */
+const d2o = (p) => (!p || p <= 0 ? "-" : (1 / p).toFixed(2));
+const d2us = (p) => {
   if (!p || p <= 0) return "-";
   return p >= 0.5 ? `-${Math.round((p / (1 - p)) * 100)}` : `+${Math.round(((1 - p) / p) * 100)}`;
 };
-const fmtVol = (v) => { const n = parseFloat(v || 0); if (n >= 1e6) return `$${(n/1e6).toFixed(1)}M`; if (n >= 1e3) return `$${(n/1e3).toFixed(0)}K`; return `$${n.toFixed(0)}`; };
-
-/* ── PARSE ── */
-const parseEvent = (raw) => {
-  const markets = raw.markets || [];
-  const title = raw.title || "";
-  const slug = raw.slug || "";
-  const vsMatch = title.match(/^(.+?)\s+(?:vs\.?|v\.?)\s+(.+?)$/i);
-  let outcomes = [];
-
-  if (markets.length > 1) {
-    outcomes = markets.filter((m) => m.outcomePrices).map((m) => {
-      const p = JSON.parse(m.outcomePrices);
-      const l = m.outcomes ? JSON.parse(m.outcomes) : [];
-      return { label: l[0] || m.groupItemTitle || m.question || "?", prob: parseFloat(p[0] || 0) };
-    }).sort((a, b) => b.prob - a.prob);
-  } else if (markets.length === 1) {
-    const m = markets[0];
-    const p = m.outcomePrices ? JSON.parse(m.outcomePrices) : [];
-    const l = m.outcomes ? JSON.parse(m.outcomes) : [];
-    outcomes = l.map((lb, i) => ({ label: lb, prob: parseFloat(p[i] || 0) }));
-  }
-
-  const allTags = [
-    ...(raw.tags || []).map((t) => (t.label || t.slug || "").toLowerCase()),
-    ...markets.flatMap((m) => (m.tags || []).map((t) => (t.label || t.slug || "").toLowerCase())),
-  ];
-
-  return {
-    id: raw.id, title, slug, isMatch: !!vsMatch,
-    team1: vsMatch ? vsMatch[1].trim() : null,
-    team2: vsMatch ? vsMatch[2].trim() : null,
-    outcomes, volume: raw.volume || 0, volume24hr: raw.volume24hr || 0,
-    polymarketUrl: polyLink(slug), allTags,
-    seriesSlug: raw.seriesSlug || "",
-  };
+const fv = (v) => {
+  const n = parseFloat(v || 0);
+  return n >= 1e6 ? `$${(n / 1e6).toFixed(1)}M` : n >= 1e3 ? `$${(n / 1e3).toFixed(0)}K` : `$${n.toFixed(0)}`;
 };
 
-/* ── COMPONENTS ── */
-const Badge = ({ label, prob, getOdds, fav }) => (
-  <div className={`ob${fav ? " ob-f" : ""}`}>
-    <span className="ob-l">{label}</span>
-    <span className="ob-v">{getOdds(prob)}</span>
-    <span className="ob-p">{(prob * 100).toFixed(0)}%</span>
-  </div>
-);
+/* Build array of dates: yesterday + today + 6 future days */
+function buildDates() {
+  const dates = [];
+  const now = new Date();
+  for (let i = -1; i <= 6; i++) {
+    const d = new Date(now);
+    d.setDate(d.getDate() + i);
+    d.setHours(0, 0, 0, 0);
+    dates.push(d);
+  }
+  return dates;
+}
 
-const MatchRow = ({ event, fmt }) => {
+function fmtDay(d) {
+  const now = new Date(); now.setHours(0,0,0,0);
+  const diff = Math.round((d - now) / 86400000);
+  if (diff === -1) return "Yesterday";
+  if (diff === 0) return "Today";
+  if (diff === 1) return "Tomorrow";
+  return d.toLocaleDateString("en-GB", { weekday: "short", day: "numeric", month: "short" });
+}
+
+function sameDay(d1, d2) {
+  return d1.getFullYear() === d2.getFullYear() &&
+    d1.getMonth() === d2.getMonth() &&
+    d1.getDate() === d2.getDate();
+}
+
+/* ─── PARSE EVENTS ─── */
+function parseEvents(rawEvents) {
+  const games = [];
+
+  for (const ev of rawEvents) {
+    const markets = ev.markets || [];
+    if (!markets.length) continue;
+
+    const title = ev.title || "";
+    const slug = ev.slug || "";
+    const vs = title.match(/^(.+?)\s+(?:vs\.?|v\.?)\s+(.+?)$/i);
+
+    // Find the game start time from the first market that has one
+    let startTime = null;
+    for (const m of markets) {
+      const t = m.gameStartTime || m.eventStartTime || null;
+      if (t) { startTime = new Date(t); break; }
+    }
+    if (!startTime && ev.startTime) startTime = new Date(ev.startTime);
+
+    // Group markets by sportsMarketType
+    const moneyline = markets.find((m) => m.sportsMarketType === "moneyline" || (!m.sportsMarketType && vs));
+    const spread = markets.filter((m) => m.sportsMarketType === "spread");
+    const total = markets.filter((m) => m.sportsMarketType === "total");
+
+    // Parse outcomes from moneyline or first market
+    let outcomes = [];
+    const src = moneyline || markets[0];
+    if (src) {
+      const prices = src.outcomePrices ? JSON.parse(src.outcomePrices) : [];
+      const labels = src.outcomes ? JSON.parse(src.outcomes) : [];
+      outcomes = labels.map((l, i) => ({ label: l, prob: parseFloat(prices[i] || 0) }));
+    }
+
+    // If multi-market event (e.g. tournament winner), parse differently
+    if (!vs && markets.length > 1) {
+      outcomes = markets.filter((m) => m.outcomePrices).map((m) => {
+        const p = JSON.parse(m.outcomePrices);
+        const l = m.outcomes ? JSON.parse(m.outcomes) : [];
+        return { label: l[0] || m.groupItemTitle || "?", prob: parseFloat(p[0] || 0) };
+      }).sort((a, b) => b.prob - a.prob);
+    }
+
+    if (!outcomes.length) continue;
+
+    games.push({
+      id: ev.id,
+      title,
+      slug,
+      isMatch: !!vs,
+      team1: vs ? vs[1].trim() : null,
+      team2: vs ? vs[2].trim() : null,
+      outcomes,
+      volume: ev.volume || 0,
+      startTime,
+      url: link(slug),
+      hasSpread: spread.length > 0,
+      hasTotal: total.length > 0,
+      seriesSlug: ev.seriesSlug || "",
+    });
+  }
+
+  return games;
+}
+
+/* ─── COMPONENTS ─── */
+
+/* Date picker */
+function DateBar({ dates, selected, onSelect }) {
+  const ref = useRef(null);
+  useEffect(() => {
+    // scroll to today on mount
+    const el = ref.current?.querySelector(".dp-a");
+    if (el) el.scrollIntoView({ inline: "center", block: "nearest" });
+  }, []);
+
+  return (
+    <div className="dp" ref={ref}>
+      {dates.map((d, i) => {
+        const sel = sameDay(d, selected);
+        return (
+          <button key={i} className={`dp-b${sel ? " dp-a" : ""}`} onClick={() => onSelect(d)}>
+            <span className="dp-d">{d.getDate()}</span>
+            <span className="dp-l">{fmtDay(d)}</span>
+          </button>
+        );
+      })}
+    </div>
+  );
+}
+
+/* Odds badge */
+function OB({ label, prob, fmt, fav }) {
+  const v = fmt === "decimal" ? d2o(prob) : d2us(prob);
+  return (
+    <div className={`ob${fav ? " ob-f" : ""}`}>
+      <span className="ob-l">{label}</span>
+      <span className="ob-v">{v}</span>
+      <span className="ob-p">{(prob * 100).toFixed(0)}%</span>
+    </div>
+  );
+}
+
+/* Match row */
+function GameRow({ g, fmt }) {
   const [exp, setExp] = useState(false);
-  const odds = (p) => (fmt === "decimal" ? prob2dec(p) : prob2us(p));
 
-  if (event.isMatch && event.outcomes.length >= 2) {
-    const t1 = event.outcomes[0]?.prob || 0;
-    const t2 = event.outcomes[1]?.prob || 0;
-    const draw = event.outcomes[2]?.prob || null;
+  // Format game time in local timezone
+  const timeStr = g.startTime
+    ? g.startTime.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })
+    : "";
+
+  if (g.isMatch && g.outcomes.length >= 2) {
+    const t1 = g.outcomes[0]?.prob || 0;
+    const t2 = g.outcomes[1]?.prob || 0;
+    const draw = g.outcomes[2]?.prob || null;
+
     return (
-      <a href={event.polymarketUrl} target="_blank" rel="noopener noreferrer" className="mr">
-        <div className="mt">
-          <div className="tr"><span className="tn" style={{ fontWeight: t1 > t2 ? 700 : 400, color: t1 > t2 ? "#fff" : "#94a3b8" }}>{event.team1}</span></div>
-          <div className="tr"><span className="tn" style={{ fontWeight: t2 > t1 ? 700 : 400, color: t2 > t1 ? "#fff" : "#94a3b8" }}>{event.team2}</span></div>
+      <a href={g.url} target="_blank" rel="noopener noreferrer" className="mr">
+        <div className="mr-time">{timeStr}</div>
+        <div className="mr-teams">
+          <span className="mr-tn" style={{ fontWeight: t1 >= t2 ? 700 : 400, color: t1 >= t2 ? "#fff" : "#8896a8" }}>{g.team1}</span>
+          <span className="mr-tn" style={{ fontWeight: t2 > t1 ? 700 : 400, color: t2 > t1 ? "#fff" : "#8896a8" }}>{g.team2}</span>
         </div>
-        <div className="oc">
-          <Badge label="1" prob={t1} getOdds={odds} fav={t1 > t2} />
-          {draw !== null && <Badge label="X" prob={draw} getOdds={odds} />}
-          <Badge label="2" prob={t2} getOdds={odds} fav={t2 > t1} />
+        <div className="mr-odds">
+          <OB label="1" prob={t1} fmt={fmt} fav={t1 >= t2} />
+          {draw !== null && <OB label="X" prob={draw} fmt={fmt} />}
+          <OB label="2" prob={t2} fmt={fmt} fav={t2 > t1} />
         </div>
-        <div className="mm"><span className="vt">{fmtVol(event.volume)}</span></div>
+        <div className="mr-vol">{fv(g.volume)}</div>
       </a>
     );
   }
 
-  const shown = exp ? event.outcomes : event.outcomes.slice(0, 5);
+  // Outright / future
+  const shown = exp ? g.outcomes : g.outcomes.slice(0, 5);
   return (
-    <div className="tb">
-      <a href={event.polymarketUrl} target="_blank" rel="noopener noreferrer" className="th">
-        <span className="tt">{event.title}</span>
-        <span className="vt">{fmtVol(event.volume)}</span>
+    <div className="out">
+      <a href={g.url} target="_blank" rel="noopener noreferrer" className="out-h">
+        <span className="out-t">{g.title}</span>
+        <span className="vt">{fv(g.volume)}</span>
       </a>
-      <div className="og">
+      <div className="out-g">
         {shown.map((o, i) => (
-          <div key={i} className="or" style={i === 0 ? { borderLeft: "2px solid #22c55e" } : {}}>
-            <span className="on" style={{ color: i === 0 ? "#fff" : "#94a3b8", fontWeight: i === 0 ? 600 : 400 }}>
-              {i === 0 && <span style={{ color: "#22c55e", fontSize: 10, marginRight: 4 }}>★</span>}{o.label}
+          <div key={i} className="out-r" style={i === 0 ? { borderLeft: "2px solid #22c55e" } : {}}>
+            <span className="out-n" style={{ color: i === 0 ? "#fff" : "#8896a8", fontWeight: i === 0 ? 600 : 400 }}>
+              {i === 0 && <span style={{ color: "#22c55e", fontSize: 10, marginRight: 4 }}>★</span>}
+              {o.label}
             </span>
-            <div className="oright">
-              <div className="pb"><div className="pbf" style={{ width: `${Math.min(o.prob * 100, 100)}%`, background: i === 0 ? "#22c55e" : "rgba(99,102,241,0.5)" }} /></div>
-              <span className="oo">{odds(o.prob)}</span>
-              <span className="op">{(o.prob * 100).toFixed(1)}%</span>
+            <div className="out-ri">
+              <div className="bar"><div className="bar-f" style={{ width: `${Math.min(o.prob * 100, 100)}%`, background: i === 0 ? "#22c55e" : "rgba(99,102,241,.5)" }} /></div>
+              <span className="out-o">{fmt === "decimal" ? d2o(o.prob) : d2us(o.prob)}</span>
+              <span className="out-p">{(o.prob * 100).toFixed(1)}%</span>
             </div>
           </div>
         ))}
       </div>
-      {event.outcomes.length > 5 && (
+      {g.outcomes.length > 5 && (
         <button className="sm" onClick={() => setExp(!exp)}>
-          {exp ? "Show less ▲" : `All ${event.outcomes.length} outcomes ▼`}
+          {exp ? "Less ▲" : `All ${g.outcomes.length} ▼`}
         </button>
       )}
     </div>
   );
-};
+}
 
-/* ── APP ── */
+/* ─── MAIN APP ─── */
 export default function App() {
-  const [sport, setSport] = useState("soccer");
-  const [data, setData] = useState({});
+  const [tab, setTab] = useState("basketball");
+  const [fmt, setFmt] = useState("decimal");
+  const [tagMap, setTagMap] = useState(null); // sport -> [tagId, ...]
+  const [events, setEvents] = useState({}); // tab -> parsed games
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState(null);
-  const [fmt, setFmt] = useState("decimal");
-  const [ts, setTs] = useState(null);
+  const [selDate, setSelDate] = useState(() => { const d = new Date(); d.setHours(0,0,0,0); return d; });
+  const dates = useMemo(buildDates, []);
 
-  const load = useCallback(async (id) => {
-    setLoading(true); setError(null);
-    const cfg = SPORTS.find((s) => s.id === id);
-    if (!cfg) return;
-    try {
-      const raw = []; const seen = new Set();
-      const add = (arr) => { for (const e of arr) if (!seen.has(e.id)) { seen.add(e.id); raw.push(e); } };
-
-      for (const sl of cfg.tagSlugs) {
-        try { add(await gammaFetch("/events", { tag_slug: sl, related_tags: "true", active: "true", closed: "false", limit: "100", order: "volume_24hr", ascending: "false" })); } catch (_) {}
+  // Step 1: discover tag IDs via /sports
+  useEffect(() => {
+    (async () => {
+      try {
+        const sports = await api("/sports");
+        const map = {};
+        for (const s of sports) {
+          const key = (s.sport || "").toLowerCase();
+          const ids = (s.tags || "").split(",").map((t) => t.trim()).filter(Boolean);
+          if (key && ids.length) map[key] = ids;
+        }
+        setTagMap(map);
+      } catch (e) {
+        console.error("Failed to load /sports:", e);
+        // Fallback hardcoded tag IDs (may need updating)
+        setTagMap({
+          basketball: ["102"],
+          soccer: ["101"],
+          tennis: ["103"],
+        });
       }
-
-      const parsed = raw.map(parseEvent).filter((e) => e.outcomes.length > 0);
-      const filtered = parsed.filter((e) => {
-        const t = e.title.toLowerCase();
-        return cfg.filterTerms.some((f) => t.includes(f)) ||
-          e.allTags.some((tag) => cfg.tagSlugs.some((s) => tag.includes(s.replace(/-/g, " ")) || tag.includes(s)));
-      });
-      filtered.sort((a, b) => parseFloat(b.volume) - parseFloat(a.volume));
-      setData((p) => ({ ...p, [id]: filtered }));
-      setTs(new Date());
-    } catch (err) { setError(err.message); } finally { setLoading(false); }
+    })();
   }, []);
 
-  useEffect(() => { load(sport); }, [sport, load]);
+  // Step 2: fetch events for selected sport
+  const loadSport = useCallback(async (sportId) => {
+    if (!tagMap) return;
+    setLoading(true);
+    setError(null);
 
-  const groups = useMemo(() => {
-    const evts = data[sport] || [];
-    const cfg = SPORTS.find((s) => s.id === sport);
-    if (!cfg || !evts.length) return [];
-    const m = {};
-    for (const e of evts) { const g = cfg.grouper(e); (m[g] ||= []).push(e); }
-    return Object.entries(m).map(([n, es]) => ({ n, es }))
-      .sort((a, b) => b.es.reduce((s, e) => s + parseFloat(e.volume), 0) - a.es.reduce((s, e) => s + parseFloat(e.volume), 0));
-  }, [data, sport]);
+    const cfg = TABS.find((t) => t.id === sportId);
+    if (!cfg) return;
 
-  const total = (data[sport] || []).length;
+    const ids = tagMap[cfg.sportKey] || [];
+    if (!ids.length) {
+      setError("No tag IDs found for this sport. Check /sports metadata.");
+      setLoading(false);
+      return;
+    }
+
+    try {
+      const all = [];
+      const seen = new Set();
+
+      for (const tagId of ids) {
+        try {
+          const data = await api("/events", {
+            tag_id: tagId,
+            active: "true",
+            closed: "false",
+            limit: "100",
+            order: "volume_24hr",
+            ascending: "false",
+          });
+          for (const ev of data) {
+            if (!seen.has(ev.id)) { seen.add(ev.id); all.push(ev); }
+          }
+        } catch (_) {}
+      }
+
+      const parsed = parseEvents(all);
+      parsed.sort((a, b) => {
+        // Sort by startTime first (nulls at end), then by volume
+        if (a.startTime && b.startTime) return a.startTime - b.startTime;
+        if (a.startTime) return -1;
+        if (b.startTime) return 1;
+        return parseFloat(b.volume) - parseFloat(a.volume);
+      });
+
+      setEvents((prev) => ({ ...prev, [sportId]: parsed }));
+    } catch (e) {
+      setError(e.message);
+    } finally {
+      setLoading(false);
+    }
+  }, [tagMap]);
+
+  useEffect(() => {
+    if (tagMap) loadSport(tab);
+  }, [tab, tagMap, loadSport]);
+
+  // Filter events by selected date
+  const filtered = useMemo(() => {
+    const all = events[tab] || [];
+    const withDate = all.filter((g) => g.startTime && sameDay(g.startTime, selDate));
+    const futures = all.filter((g) => !g.startTime && !g.isMatch); // outrights have no date
+    return { matches: withDate, futures };
+  }, [events, tab, selDate]);
+
+  const totalForDate = filtered.matches.length;
 
   return (
     <>
       <style>{CSS}</style>
       <div className="app">
+        {/* Header */}
         <header className="hdr">
-          <div className="hl">
-            <div className="logo"><span style={{ fontSize: 22 }}>📊</span><span className="lt">PolyScores</span></div>
-            <span className="tg">Polymarket Odds · Live</span>
+          <div className="hdr-l">
+            <span style={{ fontSize: 22 }}>📊</span>
+            <span className="logo">PolyScores</span>
+            <span className="sub">Live Odds</span>
           </div>
-          <div className="hr">
-            <div className="ot">
-              <button className={`tb2${fmt === "decimal" ? " a" : ""}`} onClick={() => setFmt("decimal")}>DEC</button>
-              <button className={`tb2${fmt === "american" ? " a" : ""}`} onClick={() => setFmt("american")}>US</button>
+          <div className="hdr-r">
+            <div className="tog">
+              <button className={`tog-b${fmt === "decimal" ? " tog-a" : ""}`} onClick={() => setFmt("decimal")}>DEC</button>
+              <button className={`tog-b${fmt === "american" ? " tog-a" : ""}`} onClick={() => setFmt("american")}>US</button>
             </div>
-            <button className="rb" onClick={() => load(sport)}>↻</button>
+            <button className="ref" onClick={() => loadSport(tab)}>↻</button>
           </div>
         </header>
 
+        {/* Sport tabs */}
         <nav className="tabs">
-          {SPORTS.map((s) => (
-            <button key={s.id} className={`tab${sport === s.id ? " ta" : ""}`} onClick={() => setSport(s.id)}>{s.label}</button>
+          {TABS.map((t) => (
+            <button key={t.id} className={`tab${tab === t.id ? " tab-a" : ""}`} onClick={() => setTab(t.id)}>
+              {t.label}
+            </button>
           ))}
         </nav>
 
+        {/* Date picker */}
+        <DateBar dates={dates} selected={selDate} onSelect={setSelDate} />
+
+        {/* Content */}
         <main className="ct">
-          {loading && <div className="st"><div className="sp" /><span>Loading {SPORTS.find((s) => s.id === sport)?.label}…</span></div>}
-          {error && <div className="st wn">⚠️<p>API error ({error}). Make sure <code>/api/proxy</code> is deployed.</p></div>}
-          {!loading && !error && total === 0 && (
+          {loading && (
+            <div className="st"><div className="sp" /><span>Loading…</span></div>
+          )}
+
+          {error && (
+            <div className="st err">⚠️ <p>{error}</p></div>
+          )}
+
+          {!loading && !error && totalForDate === 0 && filtered.futures.length === 0 && (
             <div className="st">
-              <span style={{ fontSize: 32 }}>{SPORTS.find((s) => s.id === sport)?.icon}</span>
-              <p style={{ color: "#94a3b8" }}>No active markets found.</p>
-              <p style={{ color: "#64748b", fontSize: 12 }}>Markets appear as events approach.</p>
+              <span style={{ fontSize: 32 }}>{TABS.find((t) => t.id === tab)?.icon}</span>
+              <p>No markets for {fmtDay(selDate).toLowerCase()}.</p>
+              <p style={{ fontSize: 12, color: "#64748b" }}>Try another date or check Futures below.</p>
             </div>
           )}
 
-          {groups.map((g) => (
-            <div key={g.n} className="grp">
-              <div className="gh">
-                <span className="gn">{g.n}</span>
-                <span className="gc">{g.es.length}</span>
+          {/* Matches for selected date */}
+          {totalForDate > 0 && (
+            <section className="sec">
+              <div className="sec-h">
+                <span className="sec-t">GAMES · {fmtDay(selDate).toUpperCase()}</span>
+                <span className="sec-c">{totalForDate}</span>
               </div>
-              {g.es.map((e) => <MatchRow key={e.id} event={e} fmt={fmt} />)}
-            </div>
-          ))}
+              {filtered.matches.map((g) => (
+                <GameRow key={g.id} g={g} fmt={fmt} />
+              ))}
+            </section>
+          )}
 
-          {ts && !loading && total > 0 && (
-            <footer className="ft">
-              <span>{total} markets</span><span className="dot">·</span>
-              <span>Updated {ts.toLocaleTimeString()}</span><span className="dot">·</span>
-              <a href="https://polymarket.com/sports" target="_blank" rel="noopener noreferrer">Trade on Polymarket →</a>
-            </footer>
+          {/* Futures / outrights (always visible) */}
+          {filtered.futures.length > 0 && (
+            <section className="sec">
+              <div className="sec-h">
+                <span className="sec-t">FUTURES & OUTRIGHTS</span>
+                <span className="sec-c">{filtered.futures.length}</span>
+              </div>
+              {filtered.futures.map((g) => (
+                <GameRow key={g.id} g={g} fmt={fmt} />
+              ))}
+            </section>
+          )}
+
+          {/* Debug info (hidden in prod, toggle with localStorage) */}
+          {typeof window !== "undefined" && localStorage.getItem("debug") && tagMap && (
+            <div style={{ padding: 16, fontSize: 10, color: "#475569", wordBreak: "break-all" }}>
+              <p>Sport: {tab} → tag_ids: {JSON.stringify(tagMap[TABS.find(t=>t.id===tab)?.sportKey])}</p>
+              <p>Total events loaded: {(events[tab] || []).length}</p>
+              <p>With startTime: {(events[tab] || []).filter(g=>g.startTime).length}</p>
+              <p>Matches for date: {totalForDate}</p>
+            </div>
           )}
         </main>
       </div>
@@ -277,89 +420,90 @@ export default function App() {
   );
 }
 
-/* ── CSS ── */
+/* ─── CSS ─── */
 const CSS = `
 @import url('https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700;800&display=swap');
-*{margin:0;padding:0;box-sizing:border-box}
-body{background:#0f1116}
-::-webkit-scrollbar{width:4px}
-::-webkit-scrollbar-thumb{background:#1e293b;border-radius:4px}
+*{margin:0;padding:0;box-sizing:border-box}body{background:#0f1116}
+::-webkit-scrollbar{width:4px;height:4px}::-webkit-scrollbar-thumb{background:#1e293b;border-radius:4px}
 
 .app{font-family:'DM Sans',sans-serif;background:#0f1116;color:#e2e8f0;min-height:100vh;max-width:680px;margin:0 auto}
 
-.hdr{display:flex;justify-content:space-between;align-items:center;padding:16px 16px 12px;border-bottom:1px solid rgba(255,255,255,.06)}
-.hl{display:flex;align-items:center;gap:12px}
-.hr{display:flex;align-items:center;gap:8px}
-.logo{display:flex;align-items:center;gap:6px}
-.lt{font-size:18px;font-weight:800;letter-spacing:-.5px;background:linear-gradient(135deg,#22c55e,#3b82f6);-webkit-background-clip:text;-webkit-text-fill-color:transparent}
-.tg{font-size:11px;color:#64748b;letter-spacing:.5px;text-transform:uppercase}
+/* Header */
+.hdr{display:flex;justify-content:space-between;align-items:center;padding:14px 16px;border-bottom:1px solid rgba(255,255,255,.06)}
+.hdr-l{display:flex;align-items:center;gap:8px}
+.hdr-r{display:flex;align-items:center;gap:8px}
+.logo{font-size:18px;font-weight:800;letter-spacing:-.5px;background:linear-gradient(135deg,#22c55e,#3b82f6);-webkit-background-clip:text;-webkit-text-fill-color:transparent}
+.sub{font-size:10px;color:#475569;text-transform:uppercase;letter-spacing:1px}
+.tog{display:flex;background:rgba(255,255,255,.06);border-radius:6px;overflow:hidden}
+.tog-b{background:none;border:none;color:#64748b;font:600 11px/1 'DM Sans',sans-serif;padding:5px 10px;cursor:pointer;letter-spacing:.5px}
+.tog-a{background:rgba(34,197,94,.2);color:#22c55e}
+.ref{background:rgba(255,255,255,.06);border:none;color:#94a3b8;font-size:16px;padding:4px 8px;border-radius:6px;cursor:pointer}
+.ref:hover{color:#fff}
 
-.ot{display:flex;background:rgba(255,255,255,.06);border-radius:6px;overflow:hidden}
-.tb2{background:none;border:none;color:#64748b;font-size:11px;font-weight:600;padding:5px 10px;cursor:pointer;letter-spacing:.5px;font-family:inherit}
-.tb2.a{background:rgba(34,197,94,.2);color:#22c55e}
-.rb{background:rgba(255,255,255,.06);border:none;color:#94a3b8;font-size:16px;padding:4px 8px;border-radius:6px;cursor:pointer}
-.rb:hover{color:#fff}
-
-.tabs{display:flex;border-bottom:1px solid rgba(255,255,255,.06);overflow-x:auto}
-.tab{flex:1;background:none;border:none;border-bottom:2px solid transparent;color:#64748b;font-size:13px;font-weight:600;padding:12px 16px;cursor:pointer;white-space:nowrap;transition:all .2s;font-family:inherit}
+/* Tabs */
+.tabs{display:flex;border-bottom:1px solid rgba(255,255,255,.06)}
+.tab{flex:1;background:none;border:none;border-bottom:2px solid transparent;color:#64748b;font:600 13px/1 'DM Sans',sans-serif;padding:12px 8px;cursor:pointer;transition:all .2s}
 .tab:hover{color:#94a3b8}
-.ta{color:#22c55e;border-bottom-color:#22c55e;background:rgba(34,197,94,.05)}
+.tab-a{color:#22c55e;border-bottom-color:#22c55e;background:rgba(34,197,94,.04)}
 
-.grp{margin-bottom:4px}
-.gh{display:flex;align-items:center;gap:8px;padding:10px 16px 6px;background:rgba(255,255,255,.02);border-bottom:1px solid rgba(255,255,255,.06)}
-.gn{font-size:12px;font-weight:700;color:#cbd5e1;letter-spacing:.3px}
-.gc{font-size:10px;font-weight:600;color:#22c55e;background:rgba(34,197,94,.15);padding:1px 6px;border-radius:10px}
+/* Date picker */
+.dp{display:flex;gap:4px;padding:10px 12px;overflow-x:auto;border-bottom:1px solid rgba(255,255,255,.06);-webkit-overflow-scrolling:touch}
+.dp-b{display:flex;flex-direction:column;align-items:center;gap:2px;padding:6px 12px;border-radius:8px;border:1px solid rgba(255,255,255,.06);background:rgba(255,255,255,.02);cursor:pointer;min-width:72px;font-family:inherit;transition:all .15s}
+.dp-b:hover{background:rgba(255,255,255,.06)}
+.dp-a{background:rgba(34,197,94,.15)!important;border-color:rgba(34,197,94,.3)!important}
+.dp-a .dp-d{color:#22c55e}
+.dp-a .dp-l{color:#22c55e}
+.dp-d{font-size:16px;font-weight:700;color:#e2e8f0}
+.dp-l{font-size:9px;color:#64748b;text-transform:uppercase;letter-spacing:.5px;white-space:nowrap}
 
-.mr{display:flex;align-items:center;padding:10px 16px;gap:12px;border-bottom:1px solid rgba(255,255,255,.04);cursor:pointer;text-decoration:none;color:inherit;transition:background .15s}
-.mr:hover{background:rgba(255,255,255,.06)}
-.mt{flex:1;min-width:0}
-.tr{display:flex;align-items:center;padding:2px 0}
-.tn{font-size:13px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+/* Sections */
+.sec{margin-bottom:4px}
+.sec-h{display:flex;align-items:center;gap:8px;padding:10px 16px 6px;background:rgba(255,255,255,.015)}
+.sec-t{font-size:11px;font-weight:700;color:#64748b;letter-spacing:1px}
+.sec-c{font-size:10px;font-weight:600;color:#22c55e;background:rgba(34,197,94,.15);padding:1px 6px;border-radius:10px}
 
-.oc{display:flex;gap:6px}
-.ob{display:flex;flex-direction:column;align-items:center;background:rgba(255,255,255,.05);border-radius:6px;padding:6px 10px;min-width:52px;gap:2px}
-.ob-f{background:rgba(34,197,94,.12);outline:1px solid rgba(34,197,94,.2)}
+/* Match row */
+.mr{display:flex;align-items:center;padding:10px 16px;gap:10px;border-bottom:1px solid rgba(255,255,255,.04);text-decoration:none;color:inherit;transition:background .15s}
+.mr:hover{background:rgba(255,255,255,.05)}
+.mr-time{font-size:11px;font-weight:600;color:#64748b;min-width:42px;text-align:center}
+.mr-teams{flex:1;display:flex;flex-direction:column;gap:3px;min-width:0}
+.mr-tn{font-size:13px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.mr-odds{display:flex;gap:5px}
+.mr-vol{font-size:10px;font-weight:600;color:#475569;min-width:40px;text-align:right}
+
+/* Odds badge */
+.ob{display:flex;flex-direction:column;align-items:center;background:rgba(255,255,255,.05);border-radius:6px;padding:5px 8px;min-width:50px;gap:1px}
+.ob-f{background:rgba(34,197,94,.1);outline:1px solid rgba(34,197,94,.2)}
 .ob-l{font-size:9px;font-weight:700;color:#64748b;letter-spacing:.5px}
-.ob-v{font-size:14px;font-weight:700;color:#fff}
-.ob-p{font-size:10px;color:#64748b}
+.ob-v{font-size:13px;font-weight:700;color:#fff}
+.ob-p{font-size:9px;color:#64748b}
 
-.mm{display:flex;flex-direction:column;align-items:flex-end;gap:2px;min-width:50px}
+/* Outright */
+.out{border-bottom:1px solid rgba(255,255,255,.04);padding-bottom:4px}
+.out-h{display:flex;justify-content:space-between;align-items:center;padding:10px 16px 6px;text-decoration:none;color:inherit}
+.out-t{font-size:13px;font-weight:600}
 .vt{font-size:10px;font-weight:600;color:#64748b;background:rgba(255,255,255,.04);padding:2px 6px;border-radius:4px}
-
-.tb{border-bottom:1px solid rgba(255,255,255,.04);padding-bottom:4px}
-.th{display:flex;justify-content:space-between;align-items:center;padding:10px 16px 6px;text-decoration:none;color:inherit}
-.tt{font-size:13px;font-weight:600;color:#e2e8f0}
-
-.og{padding:0 16px}
-.or{display:flex;justify-content:space-between;align-items:center;padding:5px 8px;border-radius:4px;margin-bottom:2px}
-.on{font-size:12px;flex:1;display:flex;align-items:center;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.oright{display:flex;align-items:center;gap:8px;flex-shrink:0}
-.pb{width:60px;height:4px;background:rgba(255,255,255,.06);border-radius:2px;overflow:hidden}
-.pbf{height:100%;border-radius:2px;transition:width .3s}
-.oo{font-size:12px;font-weight:700;color:#fff;width:40px;text-align:right}
-.op{font-size:11px;color:#64748b;width:40px;text-align:right}
-
-.sm{background:none;border:none;color:#3b82f6;font-size:11px;font-weight:600;padding:6px 16px 10px;cursor:pointer;width:100%;text-align:left;font-family:inherit}
+.out-g{padding:0 16px}
+.out-r{display:flex;justify-content:space-between;align-items:center;padding:5px 8px;border-radius:4px;margin-bottom:2px}
+.out-n{font-size:12px;flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;display:flex;align-items:center}
+.out-ri{display:flex;align-items:center;gap:8px;flex-shrink:0}
+.bar{width:56px;height:4px;background:rgba(255,255,255,.06);border-radius:2px;overflow:hidden}
+.bar-f{height:100%;border-radius:2px}
+.out-o{font-size:12px;font-weight:700;color:#fff;width:38px;text-align:right}
+.out-p{font-size:11px;color:#64748b;width:38px;text-align:right}
+.sm{background:none;border:none;color:#3b82f6;font:600 11px/1 'DM Sans',sans-serif;padding:6px 16px 10px;cursor:pointer;width:100%;text-align:left}
 .sm:hover{color:#60a5fa}
 
-.st{display:flex;flex-direction:column;align-items:center;justify-content:center;gap:12px;padding:60px 24px;color:#64748b;font-size:13px;text-align:center}
-.wn{color:#f59e0b}
-.st p{margin:0;line-height:1.6}
-.st code{background:rgba(255,255,255,.08);padding:1px 5px;border-radius:3px;font-size:11px}
-
+/* States */
+.st{display:flex;flex-direction:column;align-items:center;gap:10px;padding:50px 24px;color:#64748b;font-size:13px;text-align:center}
+.err{color:#f59e0b}
+.st p{margin:0;line-height:1.5}
 @keyframes spin{to{transform:rotate(360deg)}}
-.sp{width:24px;height:24px;border:2px solid rgba(255,255,255,.1);border-top-color:#22c55e;border-radius:50%;animation:spin .8s linear infinite}
-
-.ft{display:flex;align-items:center;justify-content:center;gap:6px;padding:16px;font-size:10px;color:#475569;flex-wrap:wrap}
-.ft .dot{color:#334155}
-.ft a{color:#3b82f6;text-decoration:none}
-.ft a:hover{color:#60a5fa}
+.sp{width:22px;height:22px;border:2px solid rgba(255,255,255,.1);border-top-color:#22c55e;border-radius:50%;animation:spin .8s linear infinite}
 
 @media(max-width:480px){
-  .ob{min-width:44px;padding:5px 6px}
-  .ob-v{font-size:12px}
-  .mr{padding:8px 12px;gap:8px}
-  .pb{width:40px}
-  .tg{display:none}
+  .ob{min-width:42px;padding:4px 6px}.ob-v{font-size:12px}
+  .mr{padding:8px 12px;gap:6px}.sub{display:none}
+  .dp-b{min-width:60px;padding:5px 8px}
 }
 `;
