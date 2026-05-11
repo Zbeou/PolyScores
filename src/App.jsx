@@ -17,9 +17,9 @@ async function api(path, params = {}) {
 
 /* Sport-specific max match duration (ms). After this, a match is considered finished. */
 const MAX_DURATION = {
-  basketball: 3.5 * 3600_000, // 3.5h
-  soccer: 3 * 3600_000,        // 3h
-  tennis: 6 * 3600_000,        // 6h (Grand Slam best-of-5 can be long)
+  basketball: 3.5 * 3600_000,
+  soccer: 3 * 3600_000,
+  tennis: 6 * 3600_000,
 };
 
 const TABS = [
@@ -92,21 +92,16 @@ function extractTournament(fullTitle, sportDefault) {
   return { tournament: sportDefault, matchTitle: fullTitle };
 }
 
-/* Detect ATP / WTA from tags or title hints */
 function detectTour(rawEvent, parsedTags) {
   const allTagSlugs = parsedTags.map((t) => t.toLowerCase());
   if (allTagSlugs.some((t) => t === "atp" || t.includes("atp-"))) return "atp";
   if (allTagSlugs.some((t) => t === "wta" || t.includes("wta-"))) return "wta";
-
   const t = (rawEvent.title || "").toLowerCase();
   if (/\b(atp|men'?s)\b/.test(t)) return "atp";
   if (/\b(wta|women'?s)\b/.test(t)) return "wta";
-
-  // Series slug fallback
   const series = (rawEvent.seriesSlug || "").toLowerCase();
   if (series.includes("atp")) return "atp";
   if (series.includes("wta")) return "wta";
-
   return "unknown";
 }
 
@@ -158,7 +153,6 @@ function parseEvent(ev, sportDefault, sportId) {
 
   if (!outcomes.length) return null;
 
-  // Collect tag slugs for tour detection
   const tagSlugs = [
     ...(ev.tags || []).map((t) => t.slug || t.label || ""),
     ...markets.flatMap((m) => (m.tags || []).map((t) => t.slug || t.label || "")),
@@ -167,26 +161,20 @@ function parseEvent(ev, sportDefault, sportId) {
   const tour = sportId === "tennis" ? detectTour(ev, tagSlugs) : null;
 
   return {
-    id: ev.id,
-    title: fullTitle,
-    matchTitle,
-    tournament,
-    slug,
+    id: ev.id, title: fullTitle, matchTitle, tournament, slug,
     isMatch: !!vs,
     team1: vs ? stripPrefix(vs[1].trim(), tournament) : null,
     team2: vs ? vs[2].trim() : null,
     outcomes,
     volume: ev.volume || 0,
-    startTime,
-    tour,
-    tagSlugs,
+    startTime, tour, tagSlugs,
     url: link(slug),
   };
 }
 
-/* Compute live/upcoming/finished status given current time */
+/* live / upcoming / finished / future (no start time) */
 function computeStatus(ev, sportId, now) {
-  if (!ev.startTime) return "future"; // outright/season-long market
+  if (!ev.startTime) return "future";
   const maxDur = MAX_DURATION[sportId] || 4 * 3600_000;
   const start = ev.startTime.getTime();
   const end = start + maxDur;
@@ -220,7 +208,6 @@ function groupByTournament(events, chronological = true) {
 }
 
 /* ─── COMPONENTS ─── */
-
 function DateBar({ dates, selected, onSelect }) {
   const ref = useRef(null);
   useEffect(() => {
@@ -242,10 +229,10 @@ function DateBar({ dates, selected, onSelect }) {
   );
 }
 
-function OB({ label, prob, fmt, fav }) {
+function OB({ label, prob, fmt, fav, dim }) {
   const v = fmt === "decimal" ? d2o(prob) : d2us(prob);
   return (
-    <div className={`ob${fav ? " ob-f" : ""}`}>
+    <div className={`ob${fav ? " ob-f" : ""}${dim ? " ob-dim" : ""}`}>
       <span className="ob-l">{label}</span>
       <span className="ob-v">{v}</span>
       <span className="ob-p">{(prob * 100).toFixed(0)}%</span>
@@ -254,7 +241,7 @@ function OB({ label, prob, fmt, fav }) {
 }
 
 function LiveDot() {
-  return <span className="live-dot" title="Live now">●</span>;
+  return <span className="live-dot" title="Live">●</span>;
 }
 
 function GameRow({ g, fmt, status }) {
@@ -263,23 +250,29 @@ function GameRow({ g, fmt, status }) {
     ? g.startTime.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })
     : "";
 
+  const isFinished = status === "finished";
+  const isLive = status === "live";
+
   if (g.isMatch && g.outcomes.length >= 2) {
     const t1 = g.outcomes[0]?.prob || 0;
     const t2 = g.outcomes[1]?.prob || 0;
     const draw = g.outcomes[2]?.prob || null;
     return (
-      <a href={g.url} target="_blank" rel="noopener noreferrer" className={`mr${status === "live" ? " mr-live" : ""}`}>
+      <a
+        href={g.url} target="_blank" rel="noopener noreferrer"
+        className={`mr${isLive ? " mr-live" : ""}${isFinished ? " mr-fin" : ""}`}
+      >
         <div className="mr-time">
-          {status === "live" ? <LiveDot /> : (timeStr || "—")}
+          {isLive ? <LiveDot /> : isFinished ? <span className="ft">FT</span> : (timeStr || "—")}
         </div>
         <div className="mr-teams">
-          <span className="mr-tn" style={{ fontWeight: t1 >= t2 ? 700 : 400, color: t1 >= t2 ? "#fff" : "#8896a8" }}>{g.team1}</span>
-          <span className="mr-tn" style={{ fontWeight: t2 > t1 ? 700 : 400, color: t2 > t1 ? "#fff" : "#8896a8" }}>{g.team2}</span>
+          <span className="mr-tn" style={{ fontWeight: t1 >= t2 ? 700 : 400, color: t1 >= t2 ? (isFinished ? "#cbd5e1" : "#fff") : "#8896a8" }}>{g.team1}</span>
+          <span className="mr-tn" style={{ fontWeight: t2 > t1 ? 700 : 400, color: t2 > t1 ? (isFinished ? "#cbd5e1" : "#fff") : "#8896a8" }}>{g.team2}</span>
         </div>
         <div className="mr-odds">
-          <OB label="1" prob={t1} fmt={fmt} fav={t1 >= t2} />
-          {draw !== null && <OB label="X" prob={draw} fmt={fmt} />}
-          <OB label="2" prob={t2} fmt={fmt} fav={t2 > t1} />
+          <OB label="1" prob={t1} fmt={fmt} fav={t1 >= t2} dim={isFinished} />
+          {draw !== null && <OB label="X" prob={draw} fmt={fmt} dim={isFinished} />}
+          <OB label="2" prob={t2} fmt={fmt} fav={t2 > t1} dim={isFinished} />
         </div>
         <div className="mr-vol">{fv(g.volume)}</div>
       </a>
@@ -339,12 +332,11 @@ export default function App() {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState(null);
   const [selDate, setSelDate] = useState(() => { const d = new Date(); d.setHours(0,0,0,0); return d; });
-  const [statusFilter, setStatusFilter] = useState("all"); // all | live | upcoming
-  const [tourFilter, setTourFilter] = useState("all");      // all | atp | wta (tennis only)
+  const [statusFilter, setStatusFilter] = useState("all");
+  const [tourFilter, setTourFilter] = useState("all");
   const [now, setNow] = useState(new Date());
   const dates = useMemo(buildDates, []);
 
-  // Refresh "now" every 30 seconds to keep live status accurate
   useEffect(() => {
     const id = setInterval(() => setNow(new Date()), 30_000);
     return () => clearInterval(id);
@@ -354,21 +346,15 @@ export default function App() {
     setLoading(true); setError(null);
     const cfg = TABS.find((t) => t.id === sportId);
     if (!cfg) return;
-
     try {
       let rawEvents = [];
       const seen = new Set();
-
       for (const slug of cfg.trySlugs) {
         try {
           const data = await api("/events", {
-            tag_slug: slug,
-            related_tags: "true",
-            active: "true",
-            closed: "false",
-            limit: "200",
-            order: "volume_24hr",
-            ascending: "false",
+            tag_slug: slug, related_tags: "true",
+            active: "true", closed: "false",
+            limit: "200", order: "volume_24hr", ascending: "false",
           });
           if (Array.isArray(data) && data.length > 0) {
             for (const ev of data) {
@@ -377,17 +363,14 @@ export default function App() {
           }
         } catch (_) {}
       }
-
       if (rawEvents.length === 0) {
         setError(`No events returned for ${cfg.label}.`);
         setEvents((p) => ({ ...p, [sportId]: [] }));
         return;
       }
-
       const parsed = rawEvents
         .map((ev) => parseEvent(ev, cfg.defaultTournament, sportId))
         .filter(Boolean);
-
       setEvents((prev) => ({ ...prev, [sportId]: parsed }));
     } catch (e) {
       setError(e.message);
@@ -398,47 +381,41 @@ export default function App() {
 
   useEffect(() => {
     loadSport(tab);
-    setTourFilter("all"); // reset tour filter when changing sport
+    setTourFilter("all");
   }, [tab, loadSport]);
 
-  // Compute status for each event (memoized with now)
   const statusMap = useMemo(() => {
     const all = events[tab] || [];
     const map = {};
-    for (const ev of all) {
-      map[ev.id] = computeStatus(ev, tab, now);
-    }
+    for (const ev of all) map[ev.id] = computeStatus(ev, tab, now);
     return map;
   }, [events, tab, now]);
 
-  // Apply all filters
-  const { matchGroups, futureGroups, liveCount, upcomingCount } = useMemo(() => {
+  const { matchGroups, futureGroups, liveCount } = useMemo(() => {
     const all = events[tab] || [];
 
-    // 1. Hide finished
-    const notFinished = all.filter((g) => statusMap[g.id] !== "finished");
-
-    // 2. Apply tour filter (tennis only)
+    // Tour filter (tennis only)
     const tourFiltered = tab === "tennis" && tourFilter !== "all"
-      ? notFinished.filter((g) => g.tour === tourFilter)
-      : notFinished;
+      ? all.filter((g) => g.tour === tourFilter)
+      : all;
 
-    // 3. Count live/upcoming for badges (across all dates)
     const liveAll = tourFiltered.filter((g) => statusMap[g.id] === "live");
-    const upcomingAll = tourFiltered.filter((g) => statusMap[g.id] === "upcoming");
 
-    // 4. Apply status filter + date filter
     let matches = [];
     let futures = [];
+
     if (statusFilter === "live") {
-      matches = liveAll; // live ignores date
+      // Live: all currently-live matches, regardless of date
+      matches = liveAll;
     } else if (statusFilter === "upcoming") {
-      matches = upcomingAll.filter((g) => g.startTime && sameDay(g.startTime, selDate));
-    } else {
-      // "all" = live + upcoming for selected date, plus futures
+      // Upcoming: future matches for selected date
       matches = tourFiltered.filter((g) =>
-        g.startTime && sameDay(g.startTime, selDate) &&
-        (statusMap[g.id] === "live" || statusMap[g.id] === "upcoming")
+        g.startTime && sameDay(g.startTime, selDate) && statusMap[g.id] === "upcoming"
+      );
+    } else {
+      // All: all matches for selected date (live + upcoming + finished), plus futures
+      matches = tourFiltered.filter((g) =>
+        g.startTime && sameDay(g.startTime, selDate)
       );
       futures = tourFiltered.filter((g) => !g.startTime && !g.isMatch);
     }
@@ -447,7 +424,6 @@ export default function App() {
       matchGroups: groupByTournament(matches, true),
       futureGroups: groupByTournament(futures, false),
       liveCount: liveAll.length,
-      upcomingCount: upcomingAll.length,
     };
   }, [events, tab, statusMap, statusFilter, tourFilter, selDate]);
 
@@ -481,7 +457,6 @@ export default function App() {
           ))}
         </nav>
 
-        {/* Tour sub-tabs (tennis only) */}
         {tab === "tennis" && (
           <div className="subtabs">
             {[
@@ -496,7 +471,6 @@ export default function App() {
           </div>
         )}
 
-        {/* Status filter pills */}
         <div className="status-bar">
           <button className={`pill${statusFilter === "all" ? " pill-a" : ""}`} onClick={() => setStatusFilter("all")}>
             All
@@ -505,11 +479,10 @@ export default function App() {
             <span className="pill-dot">●</span> Live {liveCount > 0 && <span className="pill-c">{liveCount}</span>}
           </button>
           <button className={`pill${statusFilter === "upcoming" ? " pill-a" : ""}`} onClick={() => setStatusFilter("upcoming")}>
-            Upcoming {upcomingCount > 0 && <span className="pill-c">{upcomingCount}</span>}
+            Upcoming
           </button>
         </div>
 
-        {/* Date picker (hidden when Live filter is on, since live ignores date) */}
         {statusFilter !== "live" && (
           <DateBar dates={dates} selected={selDate} onSelect={setSelDate} />
         )}
@@ -531,7 +504,7 @@ export default function App() {
                   ? "No matches live right now."
                   : statusFilter === "upcoming"
                   ? `No upcoming matches on ${fmtDay(selDate).toLowerCase()}.`
-                  : `No markets for ${fmtDay(selDate).toLowerCase()}.`}
+                  : `No matches on ${fmtDay(selDate).toLowerCase()}.`}
               </p>
               {tab === "tennis" && tourFilter !== "all" && (
                 <p style={{ fontSize: 12, color: "#64748b" }}>Try switching to All tour.</p>
@@ -577,13 +550,11 @@ const CSS = `
 .tab:hover{color:#94a3b8}
 .tab-a{color:#22c55e;border-bottom-color:#22c55e;background:rgba(34,197,94,.04)}
 
-/* Tennis sub-tabs */
 .subtabs{display:flex;gap:6px;padding:10px 16px;border-bottom:1px solid rgba(255,255,255,.06);background:rgba(255,255,255,.015)}
 .subtab{background:rgba(255,255,255,.04);border:1px solid rgba(255,255,255,.06);color:#94a3b8;font:600 11px/1 'DM Sans',sans-serif;padding:6px 14px;border-radius:14px;cursor:pointer;letter-spacing:.5px;transition:all .15s}
 .subtab:hover{background:rgba(255,255,255,.08);color:#e2e8f0}
 .subtab-a{background:rgba(59,130,246,.18);border-color:rgba(59,130,246,.35);color:#60a5fa}
 
-/* Status filter pills */
 .status-bar{display:flex;gap:6px;padding:10px 16px;border-bottom:1px solid rgba(255,255,255,.06);background:rgba(255,255,255,.01)}
 .pill{display:flex;align-items:center;gap:5px;background:rgba(255,255,255,.04);border:1px solid rgba(255,255,255,.06);color:#94a3b8;font:600 11px/1 'DM Sans',sans-serif;padding:6px 12px;border-radius:14px;cursor:pointer;letter-spacing:.5px;transition:all .15s}
 .pill:hover{background:rgba(255,255,255,.08);color:#e2e8f0}
@@ -613,8 +584,11 @@ const CSS = `
 .mr:hover{background:rgba(255,255,255,.05)}
 .mr-live{background:rgba(239,68,68,.04)}
 .mr-live:hover{background:rgba(239,68,68,.08)}
+.mr-fin{opacity:.65}
+.mr-fin:hover{opacity:.85;background:rgba(255,255,255,.04)}
 .mr-time{font-size:11px;font-weight:600;color:#64748b;min-width:42px;text-align:center}
 .live-dot{color:#ef4444;font-size:12px;animation:pulse 1.6s ease-in-out infinite}
+.ft{font-size:10px;font-weight:700;color:#64748b;background:rgba(255,255,255,.05);padding:2px 6px;border-radius:4px;letter-spacing:.5px}
 .mr-teams{flex:1;display:flex;flex-direction:column;gap:3px;min-width:0}
 .mr-tn{font-size:13px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .mr-odds{display:flex;gap:5px}
@@ -622,6 +596,7 @@ const CSS = `
 
 .ob{display:flex;flex-direction:column;align-items:center;background:rgba(255,255,255,.05);border-radius:6px;padding:5px 8px;min-width:50px;gap:1px}
 .ob-f{background:rgba(34,197,94,.1);outline:1px solid rgba(34,197,94,.2)}
+.ob-dim{opacity:.75}
 .ob-l{font-size:9px;font-weight:700;color:#64748b;letter-spacing:.5px}
 .ob-v{font-size:13px;font-weight:700;color:#fff}
 .ob-p{font-size:9px;color:#64748b}
