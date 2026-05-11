@@ -1,7 +1,10 @@
 import { useState, useEffect, useCallback, useMemo, useRef } from "react";
 
 /* ─── CONFIG ─── */
-const REF = ""; // your referral param, e.g. "?ref=CODE"
+const REF = "?r=Pingo";
+const SUPPORT_URL = "https://polymarket.com/?r=Pingo";
+const FAV_KEY = "polyscores_favorites";
+
 const link = (slug) => `https://polymarket.com/event/${slug}${REF}`;
 const isProxy = typeof window !== "undefined" && window.location.hostname !== "localhost";
 
@@ -15,7 +18,6 @@ async function api(path, params = {}) {
   return r.json();
 }
 
-/* Sport-specific max match duration (ms). After this, a match is considered finished. */
 const MAX_DURATION = {
   basketball: 3.5 * 3600_000,
   soccer: 3 * 3600_000,
@@ -109,10 +111,8 @@ function detectTour(rawEvent, parsedTags) {
 function parseEvent(ev, sportDefault, sportId) {
   const markets = ev.markets || [];
   if (!markets.length) return null;
-
   const fullTitle = ev.title || "";
   const slug = ev.slug || "";
-
   const { tournament, matchTitle } = extractTournament(fullTitle, sportDefault);
   const vs = matchTitle.match(/^(.+?)\s+(?:vs\.?|v\.?)\s+(.+?)$/i);
 
@@ -137,7 +137,6 @@ function parseEvent(ev, sportDefault, sportId) {
       }));
     } catch (_) {}
   }
-
   if (!vs && markets.length > 1) {
     outcomes = markets.filter((m) => m.outcomePrices).map((m) => {
       try {
@@ -150,14 +149,12 @@ function parseEvent(ev, sportDefault, sportId) {
       } catch { return null; }
     }).filter(Boolean).sort((a, b) => b.prob - a.prob);
   }
-
   if (!outcomes.length) return null;
 
   const tagSlugs = [
     ...(ev.tags || []).map((t) => t.slug || t.label || ""),
     ...markets.flatMap((m) => (m.tags || []).map((t) => t.slug || t.label || "")),
   ].filter(Boolean);
-
   const tour = sportId === "tennis" ? detectTour(ev, tagSlugs) : null;
 
   return {
@@ -168,11 +165,11 @@ function parseEvent(ev, sportDefault, sportId) {
     outcomes,
     volume: ev.volume || 0,
     startTime, tour, tagSlugs,
+    sportId,
     url: link(slug),
   };
 }
 
-/* live / upcoming / finished / future (no start time) */
 function computeStatus(ev, sportId, now) {
   if (!ev.startTime) return "future";
   const maxDur = MAX_DURATION[sportId] || 4 * 3600_000;
@@ -244,12 +241,23 @@ function LiveDot() {
   return <span className="live-dot" title="Live">●</span>;
 }
 
-function GameRow({ g, fmt, status }) {
+function FavBtn({ active, onClick }) {
+  return (
+    <button
+      className={`fav-btn${active ? " fav-btn-a" : ""}`}
+      onClick={(e) => { e.preventDefault(); e.stopPropagation(); onClick(); }}
+      title={active ? "Remove from favorites" : "Add to favorites"}
+    >
+      {active ? "★" : "☆"}
+    </button>
+  );
+}
+
+function GameRow({ g, fmt, status, isFav, onToggleFav }) {
   const [exp, setExp] = useState(false);
   const timeStr = g.startTime
     ? g.startTime.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })
     : "";
-
   const isFinished = status === "finished";
   const isLive = status === "live";
 
@@ -274,7 +282,10 @@ function GameRow({ g, fmt, status }) {
           {draw !== null && <OB label="X" prob={draw} fmt={fmt} dim={isFinished} />}
           <OB label="2" prob={t2} fmt={fmt} fav={t2 > t1} dim={isFinished} />
         </div>
-        <div className="mr-vol">{fv(g.volume)}</div>
+        <div className="mr-right">
+          <FavBtn active={isFav} onClick={onToggleFav} />
+          <span className="mr-vol">{fv(g.volume)}</span>
+        </div>
       </a>
     );
   }
@@ -284,7 +295,10 @@ function GameRow({ g, fmt, status }) {
     <div className="out">
       <a href={g.url} target="_blank" rel="noopener noreferrer" className="out-h">
         <span className="out-t">{g.matchTitle}</span>
-        <span className="vt">{fv(g.volume)}</span>
+        <div className="out-h-r">
+          <FavBtn active={isFav} onClick={onToggleFav} />
+          <span className="vt">{fv(g.volume)}</span>
+        </div>
       </a>
       <div className="out-g">
         {shown.map((o, i) => (
@@ -310,7 +324,7 @@ function GameRow({ g, fmt, status }) {
   );
 }
 
-function TournamentSection({ group, fmt, statusMap }) {
+function TournamentSection({ group, fmt, statusMap, favorites, onToggleFav }) {
   return (
     <section className="sec">
       <div className="sec-h">
@@ -318,7 +332,12 @@ function TournamentSection({ group, fmt, statusMap }) {
         <span className="sec-c">{group.events.length}</span>
       </div>
       {group.events.map((ev) => (
-        <GameRow key={ev.id} g={ev} fmt={fmt} status={statusMap[ev.id]} />
+        <GameRow
+          key={ev.id} g={ev} fmt={fmt}
+          status={statusMap[ev.id]}
+          isFav={favorites.has(ev.id)}
+          onToggleFav={() => onToggleFav(ev.id)}
+        />
       ))}
     </section>
   );
@@ -335,8 +354,30 @@ export default function App() {
   const [statusFilter, setStatusFilter] = useState("all");
   const [tourFilter, setTourFilter] = useState("all");
   const [now, setNow] = useState(new Date());
+  const [favoritesView, setFavoritesView] = useState(false);
+  const [favorites, setFavorites] = useState(() => {
+    if (typeof window === "undefined") return new Set();
+    try { return new Set(JSON.parse(localStorage.getItem(FAV_KEY) || "[]")); }
+    catch { return new Set(); }
+  });
+
   const dates = useMemo(buildDates, []);
 
+  // Persist favorites
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    localStorage.setItem(FAV_KEY, JSON.stringify([...favorites]));
+  }, [favorites]);
+
+  const toggleFav = useCallback((id) => {
+    setFavorites((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id); else next.add(id);
+      return next;
+    });
+  }, []);
+
+  // Live status refresh
   useEffect(() => {
     const id = setInterval(() => setNow(new Date()), 30_000);
     return () => clearInterval(id);
@@ -349,6 +390,8 @@ export default function App() {
     try {
       let rawEvents = [];
       const seen = new Set();
+
+      // 1. Open events (upcoming + live)
       for (const slug of cfg.trySlugs) {
         try {
           const data = await api("/events", {
@@ -356,22 +399,47 @@ export default function App() {
             active: "true", closed: "false",
             limit: "200", order: "volume_24hr", ascending: "false",
           });
-          if (Array.isArray(data) && data.length > 0) {
+          if (Array.isArray(data)) {
             for (const ev of data) {
               if (!seen.has(ev.id)) { seen.add(ev.id); rawEvents.push(ev); }
             }
           }
         } catch (_) {}
       }
+
+      // 2. Recently closed events (for finished matches)
+      for (const slug of cfg.trySlugs) {
+        try {
+          const data = await api("/events", {
+            tag_slug: slug, related_tags: "true",
+            closed: "true", archived: "false",
+            limit: "50", order: "endDate", ascending: "false",
+          });
+          if (Array.isArray(data)) {
+            for (const ev of data) {
+              if (!seen.has(ev.id)) { seen.add(ev.id); rawEvents.push(ev); }
+            }
+          }
+        } catch (_) {}
+      }
+
       if (rawEvents.length === 0) {
         setError(`No events returned for ${cfg.label}.`);
         setEvents((p) => ({ ...p, [sportId]: [] }));
         return;
       }
+
       const parsed = rawEvents
         .map((ev) => parseEvent(ev, cfg.defaultTournament, sportId))
         .filter(Boolean);
-      setEvents((prev) => ({ ...prev, [sportId]: parsed }));
+
+      // Filter out very old events (start date > 2 days ago for non-future ones)
+      const cutoff = Date.now() - 2.5 * 86400_000;
+      const cleaned = parsed.filter((e) =>
+        !e.startTime || e.startTime.getTime() >= cutoff || !e.isMatch
+      );
+
+      setEvents((prev) => ({ ...prev, [sportId]: cleaned }));
     } catch (e) {
       setError(e.message);
     } finally {
@@ -384,36 +452,54 @@ export default function App() {
     setTourFilter("all");
   }, [tab, loadSport]);
 
+  // Load all sports when entering favorites view (to show all favorites)
+  useEffect(() => {
+    if (!favoritesView) return;
+    for (const t of TABS) {
+      if (!events[t.id]) loadSport(t.id);
+    }
+  }, [favoritesView, events, loadSport]);
+
   const statusMap = useMemo(() => {
-    const all = events[tab] || [];
+    const all = favoritesView
+      ? Object.values(events).flat()
+      : (events[tab] || []);
     const map = {};
-    for (const ev of all) map[ev.id] = computeStatus(ev, tab, now);
+    for (const ev of all) map[ev.id] = computeStatus(ev, ev.sportId || tab, now);
     return map;
-  }, [events, tab, now]);
+  }, [events, tab, now, favoritesView]);
 
   const { matchGroups, futureGroups, liveCount } = useMemo(() => {
-    const all = events[tab] || [];
+    // FAVORITES VIEW: show all favorited events across all sports, no date filter
+    if (favoritesView) {
+      const allEvents = Object.values(events).flat();
+      const favEvents = allEvents.filter((e) => favorites.has(e.id));
+      const matches = favEvents.filter((e) => e.isMatch);
+      const futures = favEvents.filter((e) => !e.startTime && !e.isMatch);
+      return {
+        matchGroups: groupByTournament(matches, true),
+        futureGroups: groupByTournament(futures, false),
+        liveCount: matches.filter((e) => statusMap[e.id] === "live").length,
+      };
+    }
 
-    // Tour filter (tennis only)
+    const all = events[tab] || [];
     const tourFiltered = tab === "tennis" && tourFilter !== "all"
       ? all.filter((g) => g.tour === tourFilter)
       : all;
-
     const liveAll = tourFiltered.filter((g) => statusMap[g.id] === "live");
 
     let matches = [];
     let futures = [];
 
     if (statusFilter === "live") {
-      // Live: all currently-live matches, regardless of date
       matches = liveAll;
     } else if (statusFilter === "upcoming") {
-      // Upcoming: future matches for selected date
       matches = tourFiltered.filter((g) =>
         g.startTime && sameDay(g.startTime, selDate) && statusMap[g.id] === "upcoming"
       );
     } else {
-      // All: all matches for selected date (live + upcoming + finished), plus futures
+      // All: ALL matches for selected date (finished + live + upcoming)
       matches = tourFiltered.filter((g) =>
         g.startTime && sameDay(g.startTime, selDate)
       );
@@ -425,7 +511,7 @@ export default function App() {
       futureGroups: groupByTournament(futures, false),
       liveCount: liveAll.length,
     };
-  }, [events, tab, statusMap, statusFilter, tourFilter, selDate]);
+  }, [events, tab, statusMap, statusFilter, tourFilter, selDate, favoritesView, favorites]);
 
   const totalMatches = matchGroups.reduce((s, g) => s + g.events.length, 0);
   const totalFutures = futureGroups.reduce((s, g) => s + g.events.length, 0);
@@ -438,9 +524,25 @@ export default function App() {
           <div className="hdr-l">
             <span style={{ fontSize: 22 }}>📊</span>
             <span className="logo">PolyScores</span>
-            <span className="sub">Live Odds</span>
           </div>
           <div className="hdr-r">
+            <button
+              className={`hdr-btn${favoritesView ? " hdr-btn-a" : ""}`}
+              onClick={() => setFavoritesView(!favoritesView)}
+              title="My favorites"
+            >
+              ★ <span className="hdr-lbl">Favorites</span>
+              {favorites.size > 0 && <span className="hdr-cnt">{favorites.size}</span>}
+            </button>
+            <a
+              className="hdr-btn hdr-support"
+              href={SUPPORT_URL}
+              target="_blank"
+              rel="noopener noreferrer"
+              title="Support PolyScores"
+            >
+              ❤ <span className="hdr-lbl">Support</span>
+            </a>
             <div className="tog">
               <button className={`tog-b${fmt === "decimal" ? " tog-a" : ""}`} onClick={() => setFmt("decimal")}>DEC</button>
               <button className={`tog-b${fmt === "american" ? " tog-a" : ""}`} onClick={() => setFmt("american")}>US</button>
@@ -449,21 +551,20 @@ export default function App() {
           </div>
         </header>
 
-        <nav className="tabs">
-          {TABS.map((t) => (
-            <button key={t.id} className={`tab${tab === t.id ? " tab-a" : ""}`} onClick={() => setTab(t.id)}>
-              {t.label}
-            </button>
-          ))}
-        </nav>
+        {/* Sport tabs hidden in favorites view */}
+        {!favoritesView && (
+          <nav className="tabs">
+            {TABS.map((t) => (
+              <button key={t.id} className={`tab${tab === t.id ? " tab-a" : ""}`} onClick={() => setTab(t.id)}>
+                {t.label}
+              </button>
+            ))}
+          </nav>
+        )}
 
-        {tab === "tennis" && (
+        {!favoritesView && tab === "tennis" && (
           <div className="subtabs">
-            {[
-              { id: "all", label: "All" },
-              { id: "atp", label: "ATP" },
-              { id: "wta", label: "WTA" },
-            ].map((s) => (
+            {[{ id: "all", label: "All" }, { id: "atp", label: "ATP" }, { id: "wta", label: "WTA" }].map((s) => (
               <button key={s.id} className={`subtab${tourFilter === s.id ? " subtab-a" : ""}`} onClick={() => setTourFilter(s.id)}>
                 {s.label}
               </button>
@@ -471,56 +572,62 @@ export default function App() {
           </div>
         )}
 
-        <div className="status-bar">
-          <button className={`pill${statusFilter === "all" ? " pill-a" : ""}`} onClick={() => setStatusFilter("all")}>
-            All
-          </button>
-          <button className={`pill${statusFilter === "live" ? " pill-a pill-live" : ""}`} onClick={() => setStatusFilter("live")}>
-            <span className="pill-dot">●</span> Live {liveCount > 0 && <span className="pill-c">{liveCount}</span>}
-          </button>
-          <button className={`pill${statusFilter === "upcoming" ? " pill-a" : ""}`} onClick={() => setStatusFilter("upcoming")}>
-            Upcoming
-          </button>
-        </div>
+        {/* Status pills hidden in favorites view */}
+        {!favoritesView && (
+          <div className="status-bar">
+            <button className={`pill${statusFilter === "all" ? " pill-a" : ""}`} onClick={() => setStatusFilter("all")}>All</button>
+            <button className={`pill${statusFilter === "live" ? " pill-a pill-live" : ""}`} onClick={() => setStatusFilter("live")}>
+              <span className="pill-dot">●</span> Live {liveCount > 0 && <span className="pill-c">{liveCount}</span>}
+            </button>
+            <button className={`pill${statusFilter === "upcoming" ? " pill-a" : ""}`} onClick={() => setStatusFilter("upcoming")}>Upcoming</button>
+          </div>
+        )}
 
-        {statusFilter !== "live" && (
+        {/* Date bar hidden in favorites view + when live filter is active */}
+        {!favoritesView && statusFilter !== "live" && (
           <DateBar dates={dates} selected={selDate} onSelect={setSelDate} />
         )}
 
-        <main className="ct">
-          {loading && (
-            <div className="st"><div className="sp" /><span>Loading…</span></div>
-          )}
+        {/* Favorites view banner */}
+        {favoritesView && (
+          <div className="fav-banner">
+            <span>★ Your favorite matches</span>
+            <button className="fav-back" onClick={() => setFavoritesView(false)}>← Back to all</button>
+          </div>
+        )}
 
-          {error && (
-            <div className="st err">⚠️<p>{error}</p></div>
-          )}
+        <main className="ct">
+          {loading && <div className="st"><div className="sp" /><span>Loading…</span></div>}
+          {error && <div className="st err">⚠️<p>{error}</p></div>}
 
           {!loading && !error && totalMatches === 0 && totalFutures === 0 && (
             <div className="st">
-              <span style={{ fontSize: 32 }}>{TABS.find((t) => t.id === tab)?.icon}</span>
+              <span style={{ fontSize: 32 }}>{favoritesView ? "☆" : TABS.find((t) => t.id === tab)?.icon}</span>
               <p>
-                {statusFilter === "live"
+                {favoritesView
+                  ? "No favorites yet. Tap ☆ on any match to add it."
+                  : statusFilter === "live"
                   ? "No matches live right now."
                   : statusFilter === "upcoming"
                   ? `No upcoming matches on ${fmtDay(selDate).toLowerCase()}.`
                   : `No matches on ${fmtDay(selDate).toLowerCase()}.`}
               </p>
-              {tab === "tennis" && tourFilter !== "all" && (
-                <p style={{ fontSize: 12, color: "#64748b" }}>Try switching to All tour.</p>
-              )}
             </div>
           )}
 
           {matchGroups.map((g) => (
-            <TournamentSection key={"m-" + g.name} group={g} fmt={fmt} statusMap={statusMap} />
+            <TournamentSection
+              key={"m-" + g.name} group={g} fmt={fmt}
+              statusMap={statusMap} favorites={favorites} onToggleFav={toggleFav}
+            />
           ))}
 
-          {futureGroups.length > 0 && (
-            <div className="div">FUTURES & OUTRIGHTS</div>
-          )}
+          {futureGroups.length > 0 && <div className="div">FUTURES & OUTRIGHTS</div>}
           {futureGroups.map((g) => (
-            <TournamentSection key={"f-" + g.name} group={g} fmt={fmt} statusMap={statusMap} />
+            <TournamentSection
+              key={"f-" + g.name} group={g} fmt={fmt}
+              statusMap={statusMap} favorites={favorites} onToggleFav={toggleFav}
+            />
           ))}
         </main>
       </div>
@@ -534,11 +641,19 @@ const CSS = `
 ::-webkit-scrollbar{width:4px;height:4px}::-webkit-scrollbar-thumb{background:#1e293b;border-radius:4px}
 .app{font-family:'DM Sans',sans-serif;background:#0f1116;color:#e2e8f0;min-height:100vh;max-width:680px;margin:0 auto}
 
-.hdr{display:flex;justify-content:space-between;align-items:center;padding:14px 16px;border-bottom:1px solid rgba(255,255,255,.06)}
-.hdr-l{display:flex;align-items:center;gap:8px}
-.hdr-r{display:flex;align-items:center;gap:8px}
+.hdr{display:flex;justify-content:space-between;align-items:center;padding:14px 16px;border-bottom:1px solid rgba(255,255,255,.06);gap:10px;flex-wrap:wrap}
+.hdr-l{display:flex;align-items:center;gap:8px;flex-shrink:0}
+.hdr-r{display:flex;align-items:center;gap:6px;flex-wrap:wrap;justify-content:flex-end}
 .logo{font-size:18px;font-weight:800;letter-spacing:-.5px;background:linear-gradient(135deg,#22c55e,#3b82f6);-webkit-background-clip:text;-webkit-text-fill-color:transparent}
-.sub{font-size:10px;color:#475569;text-transform:uppercase;letter-spacing:1px}
+
+.hdr-btn{display:flex;align-items:center;gap:4px;background:rgba(255,255,255,.05);border:1px solid rgba(255,255,255,.08);color:#cbd5e1;font:600 11px/1 'DM Sans',sans-serif;padding:6px 10px;border-radius:6px;cursor:pointer;letter-spacing:.3px;text-decoration:none;transition:all .15s}
+.hdr-btn:hover{background:rgba(255,255,255,.1);color:#fff}
+.hdr-btn-a{background:rgba(234,179,8,.15);border-color:rgba(234,179,8,.35);color:#fbbf24}
+.hdr-support{color:#f87171}
+.hdr-support:hover{background:rgba(239,68,68,.12);color:#fca5a5;border-color:rgba(239,68,68,.3)}
+.hdr-cnt{background:rgba(255,255,255,.15);font-size:9px;padding:1px 5px;border-radius:8px;margin-left:2px}
+.hdr-btn-a .hdr-cnt{background:rgba(234,179,8,.3);color:#fbbf24}
+
 .tog{display:flex;background:rgba(255,255,255,.06);border-radius:6px;overflow:hidden}
 .tog-b{background:none;border:none;color:#64748b;font:600 11px/1 'DM Sans',sans-serif;padding:5px 10px;cursor:pointer;letter-spacing:.5px}
 .tog-a{background:rgba(34,197,94,.2);color:#22c55e}
@@ -573,6 +688,11 @@ const CSS = `
 .dp-d{font-size:16px;font-weight:700;color:#e2e8f0}
 .dp-l{font-size:9px;color:#64748b;text-transform:uppercase;letter-spacing:.5px;white-space:nowrap}
 
+.fav-banner{display:flex;align-items:center;justify-content:space-between;padding:12px 16px;background:linear-gradient(180deg,rgba(234,179,8,.08),rgba(255,255,255,.015));border-bottom:1px solid rgba(234,179,8,.2)}
+.fav-banner span{font:700 13px/1 'DM Sans',sans-serif;color:#fbbf24;letter-spacing:.3px}
+.fav-back{background:rgba(255,255,255,.06);border:1px solid rgba(255,255,255,.08);color:#cbd5e1;font:600 11px/1 'DM Sans',sans-serif;padding:6px 10px;border-radius:6px;cursor:pointer}
+.fav-back:hover{background:rgba(255,255,255,.1);color:#fff}
+
 .sec{margin-bottom:2px}
 .sec-h{display:flex;align-items:center;gap:8px;padding:10px 16px 6px;background:linear-gradient(180deg,rgba(34,197,94,.06),rgba(255,255,255,.015));border-bottom:1px solid rgba(34,197,94,.15);border-top:1px solid rgba(255,255,255,.04)}
 .sec-t{font-size:12px;font-weight:700;color:#e2e8f0;letter-spacing:.3px;flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
@@ -592,7 +712,13 @@ const CSS = `
 .mr-teams{flex:1;display:flex;flex-direction:column;gap:3px;min-width:0}
 .mr-tn{font-size:13px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .mr-odds{display:flex;gap:5px}
-.mr-vol{font-size:10px;font-weight:600;color:#475569;min-width:40px;text-align:right}
+.mr-right{display:flex;flex-direction:column;align-items:flex-end;gap:3px;min-width:40px}
+.mr-vol{font-size:10px;font-weight:600;color:#475569}
+
+.fav-btn{background:none;border:none;color:#475569;font-size:16px;line-height:1;cursor:pointer;padding:2px 4px;border-radius:4px;transition:all .15s}
+.fav-btn:hover{color:#fbbf24;background:rgba(234,179,8,.1)}
+.fav-btn-a{color:#fbbf24}
+.fav-btn-a:hover{color:#fcd34d}
 
 .ob{display:flex;flex-direction:column;align-items:center;background:rgba(255,255,255,.05);border-radius:6px;padding:5px 8px;min-width:50px;gap:1px}
 .ob-f{background:rgba(34,197,94,.1);outline:1px solid rgba(34,197,94,.2)}
@@ -602,8 +728,9 @@ const CSS = `
 .ob-p{font-size:9px;color:#64748b}
 
 .out{border-bottom:1px solid rgba(255,255,255,.04);padding-bottom:4px}
-.out-h{display:flex;justify-content:space-between;align-items:center;padding:10px 16px 6px;text-decoration:none;color:inherit}
-.out-t{font-size:13px;font-weight:600}
+.out-h{display:flex;justify-content:space-between;align-items:center;padding:10px 16px 6px;text-decoration:none;color:inherit;gap:10px}
+.out-t{font-size:13px;font-weight:600;flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.out-h-r{display:flex;align-items:center;gap:6px;flex-shrink:0}
 .vt{font-size:10px;font-weight:600;color:#64748b;background:rgba(255,255,255,.04);padding:2px 6px;border-radius:4px}
 .out-g{padding:0 16px}
 .out-r{display:flex;justify-content:space-between;align-items:center;padding:5px 8px;border-radius:4px;margin-bottom:2px}
@@ -622,9 +749,13 @@ const CSS = `
 @keyframes spin{to{transform:rotate(360deg)}}
 .sp{width:22px;height:22px;border:2px solid rgba(255,255,255,.1);border-top-color:#22c55e;border-radius:50%;animation:spin .8s linear infinite}
 
+@media(max-width:540px){
+  .hdr-lbl{display:none}
+  .hdr-btn{padding:6px 8px}
+}
 @media(max-width:480px){
   .ob{min-width:42px;padding:4px 6px}.ob-v{font-size:12px}
-  .mr{padding:8px 12px;gap:6px}.sub{display:none}
+  .mr{padding:8px 12px;gap:6px}
   .dp-b{min-width:60px;padding:5px 8px}
 }
 `;
