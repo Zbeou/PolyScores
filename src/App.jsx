@@ -15,6 +15,13 @@ async function api(path, params = {}) {
   return r.json();
 }
 
+/* Sport-specific max match duration (ms). After this, a match is considered finished. */
+const MAX_DURATION = {
+  basketball: 3.5 * 3600_000, // 3.5h
+  soccer: 3 * 3600_000,        // 3h
+  tennis: 6 * 3600_000,        // 6h (Grand Slam best-of-5 can be long)
+};
+
 const TABS = [
   { id: "basketball", label: "🏀 NBA", icon: "🏀",
     trySlugs: ["nba", "basketball", "nba-finals", "nba-playoffs"],
@@ -65,7 +72,6 @@ function sameDay(d1, d2) {
     d1.getDate() === d2.getDate();
 }
 
-/* Strip "Tournament: " prefix from a label if present */
 function stripPrefix(label, prefix) {
   if (!label || !prefix) return label;
   const p = `${prefix}:`;
@@ -75,13 +81,10 @@ function stripPrefix(label, prefix) {
   return label;
 }
 
-/* Extract tournament and match title from full event title */
 function extractTournament(fullTitle, sportDefault) {
-  // Look for "Tournament Name: rest of title" pattern
   const m = fullTitle.match(/^([^:]+?):\s+(.+)$/);
   if (m) {
     const candidate = m[1].trim();
-    // Sanity check: tournament name should be relatively short and not contain "vs"
     if (candidate.length < 80 && !/\bvs?\.?\b/i.test(candidate)) {
       return { tournament: candidate, matchTitle: m[2].trim() };
     }
@@ -89,21 +92,35 @@ function extractTournament(fullTitle, sportDefault) {
   return { tournament: sportDefault, matchTitle: fullTitle };
 }
 
+/* Detect ATP / WTA from tags or title hints */
+function detectTour(rawEvent, parsedTags) {
+  const allTagSlugs = parsedTags.map((t) => t.toLowerCase());
+  if (allTagSlugs.some((t) => t === "atp" || t.includes("atp-"))) return "atp";
+  if (allTagSlugs.some((t) => t === "wta" || t.includes("wta-"))) return "wta";
+
+  const t = (rawEvent.title || "").toLowerCase();
+  if (/\b(atp|men'?s)\b/.test(t)) return "atp";
+  if (/\b(wta|women'?s)\b/.test(t)) return "wta";
+
+  // Series slug fallback
+  const series = (rawEvent.seriesSlug || "").toLowerCase();
+  if (series.includes("atp")) return "atp";
+  if (series.includes("wta")) return "wta";
+
+  return "unknown";
+}
+
 /* ─── PARSE EVENTS ─── */
-function parseEvent(ev, sportDefault) {
+function parseEvent(ev, sportDefault, sportId) {
   const markets = ev.markets || [];
   if (!markets.length) return null;
 
   const fullTitle = ev.title || "";
   const slug = ev.slug || "";
 
-  // Extract tournament & cleaned match title
   const { tournament, matchTitle } = extractTournament(fullTitle, sportDefault);
-
-  // Detect "Team1 vs Team2" within the cleaned match title
   const vs = matchTitle.match(/^(.+?)\s+(?:vs\.?|v\.?)\s+(.+?)$/i);
 
-  // Game start time
   let startTime = null;
   for (const m of markets) {
     const t = m.gameStartTime || m.eventStartTime || null;
@@ -112,7 +129,6 @@ function parseEvent(ev, sportDefault) {
   if (!startTime && ev.startTime) startTime = new Date(ev.startTime);
   if (!startTime && ev.startDate) startTime = new Date(ev.startDate);
 
-  // Parse outcomes (cleaning labels of tournament prefix)
   const moneyline = markets.find((m) => m.sportsMarketType === "moneyline" || (!m.sportsMarketType && vs));
   let outcomes = [];
   const src = moneyline || markets[0];
@@ -142,6 +158,14 @@ function parseEvent(ev, sportDefault) {
 
   if (!outcomes.length) return null;
 
+  // Collect tag slugs for tour detection
+  const tagSlugs = [
+    ...(ev.tags || []).map((t) => t.slug || t.label || ""),
+    ...markets.flatMap((m) => (m.tags || []).map((t) => t.slug || t.label || "")),
+  ].filter(Boolean);
+
+  const tour = sportId === "tennis" ? detectTour(ev, tagSlugs) : null;
+
   return {
     id: ev.id,
     title: fullTitle,
@@ -154,11 +178,24 @@ function parseEvent(ev, sportDefault) {
     outcomes,
     volume: ev.volume || 0,
     startTime,
+    tour,
+    tagSlugs,
     url: link(slug),
   };
 }
 
-/* Group events by tournament. Sort groups by total volume desc, events within by startTime asc */
+/* Compute live/upcoming/finished status given current time */
+function computeStatus(ev, sportId, now) {
+  if (!ev.startTime) return "future"; // outright/season-long market
+  const maxDur = MAX_DURATION[sportId] || 4 * 3600_000;
+  const start = ev.startTime.getTime();
+  const end = start + maxDur;
+  const nowT = now.getTime();
+  if (nowT < start) return "upcoming";
+  if (nowT >= start && nowT <= end) return "live";
+  return "finished";
+}
+
 function groupByTournament(events, chronological = true) {
   const map = new Map();
   for (const ev of events) {
@@ -166,8 +203,6 @@ function groupByTournament(events, chronological = true) {
     if (!map.has(key)) map.set(key, []);
     map.get(key).push(ev);
   }
-
-  // Sort each group
   for (const [, evs] of map) {
     evs.sort((a, b) => {
       if (chronological && a.startTime && b.startTime) return a.startTime - b.startTime;
@@ -176,12 +211,9 @@ function groupByTournament(events, chronological = true) {
       return parseFloat(b.volume) - parseFloat(a.volume);
     });
   }
-
-  // Sort groups by total volume desc
   return Array.from(map.entries())
     .map(([name, evs]) => ({
-      name,
-      events: evs,
+      name, events: evs,
       totalVolume: evs.reduce((s, e) => s + parseFloat(e.volume || 0), 0),
     }))
     .sort((a, b) => b.totalVolume - a.totalVolume);
@@ -221,7 +253,11 @@ function OB({ label, prob, fmt, fav }) {
   );
 }
 
-function GameRow({ g, fmt }) {
+function LiveDot() {
+  return <span className="live-dot" title="Live now">●</span>;
+}
+
+function GameRow({ g, fmt, status }) {
   const [exp, setExp] = useState(false);
   const timeStr = g.startTime
     ? g.startTime.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })
@@ -232,8 +268,10 @@ function GameRow({ g, fmt }) {
     const t2 = g.outcomes[1]?.prob || 0;
     const draw = g.outcomes[2]?.prob || null;
     return (
-      <a href={g.url} target="_blank" rel="noopener noreferrer" className="mr">
-        <div className="mr-time">{timeStr || "—"}</div>
+      <a href={g.url} target="_blank" rel="noopener noreferrer" className={`mr${status === "live" ? " mr-live" : ""}`}>
+        <div className="mr-time">
+          {status === "live" ? <LiveDot /> : (timeStr || "—")}
+        </div>
         <div className="mr-teams">
           <span className="mr-tn" style={{ fontWeight: t1 >= t2 ? 700 : 400, color: t1 >= t2 ? "#fff" : "#8896a8" }}>{g.team1}</span>
           <span className="mr-tn" style={{ fontWeight: t2 > t1 ? 700 : 400, color: t2 > t1 ? "#fff" : "#8896a8" }}>{g.team2}</span>
@@ -248,7 +286,6 @@ function GameRow({ g, fmt }) {
     );
   }
 
-  // Outright / future — display matchTitle (without tournament prefix since shown in group header)
   const shown = exp ? g.outcomes : g.outcomes.slice(0, 5);
   return (
     <div className="out">
@@ -280,7 +317,7 @@ function GameRow({ g, fmt }) {
   );
 }
 
-function TournamentSection({ group, fmt }) {
+function TournamentSection({ group, fmt, statusMap }) {
   return (
     <section className="sec">
       <div className="sec-h">
@@ -288,7 +325,7 @@ function TournamentSection({ group, fmt }) {
         <span className="sec-c">{group.events.length}</span>
       </div>
       {group.events.map((ev) => (
-        <GameRow key={ev.id} g={ev} fmt={fmt} />
+        <GameRow key={ev.id} g={ev} fmt={fmt} status={statusMap[ev.id]} />
       ))}
     </section>
   );
@@ -301,23 +338,28 @@ export default function App() {
   const [events, setEvents] = useState({});
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState(null);
-  const [debug, setDebug] = useState({});
   const [selDate, setSelDate] = useState(() => { const d = new Date(); d.setHours(0,0,0,0); return d; });
+  const [statusFilter, setStatusFilter] = useState("all"); // all | live | upcoming
+  const [tourFilter, setTourFilter] = useState("all");      // all | atp | wta (tennis only)
+  const [now, setNow] = useState(new Date());
   const dates = useMemo(buildDates, []);
+
+  // Refresh "now" every 30 seconds to keep live status accurate
+  useEffect(() => {
+    const id = setInterval(() => setNow(new Date()), 30_000);
+    return () => clearInterval(id);
+  }, []);
 
   const loadSport = useCallback(async (sportId) => {
     setLoading(true); setError(null);
     const cfg = TABS.find((t) => t.id === sportId);
     if (!cfg) return;
 
-    const debugInfo = { triedSlugs: [], successSlug: null, eventCount: 0 };
-
     try {
       let rawEvents = [];
       const seen = new Set();
 
       for (const slug of cfg.trySlugs) {
-        debugInfo.triedSlugs.push(slug);
         try {
           const data = await api("/events", {
             tag_slug: slug,
@@ -332,15 +374,9 @@ export default function App() {
             for (const ev of data) {
               if (!seen.has(ev.id)) { seen.add(ev.id); rawEvents.push(ev); }
             }
-            if (!debugInfo.successSlug) debugInfo.successSlug = slug;
           }
-        } catch (e) {
-          debugInfo[`err_${slug}`] = e.message;
-        }
+        } catch (_) {}
       }
-
-      debugInfo.eventCount = rawEvents.length;
-      setDebug((prev) => ({ ...prev, [sportId]: debugInfo }));
 
       if (rawEvents.length === 0) {
         setError(`No events returned for ${cfg.label}.`);
@@ -349,7 +385,7 @@ export default function App() {
       }
 
       const parsed = rawEvents
-        .map((ev) => parseEvent(ev, cfg.defaultTournament))
+        .map((ev) => parseEvent(ev, cfg.defaultTournament, sportId))
         .filter(Boolean);
 
       setEvents((prev) => ({ ...prev, [sportId]: parsed }));
@@ -362,22 +398,61 @@ export default function App() {
 
   useEffect(() => {
     loadSport(tab);
+    setTourFilter("all"); // reset tour filter when changing sport
   }, [tab, loadSport]);
 
-  /* Filter by date, then group by tournament */
-  const { matchGroups, futureGroups } = useMemo(() => {
+  // Compute status for each event (memoized with now)
+  const statusMap = useMemo(() => {
     const all = events[tab] || [];
-    const matchesForDate = all.filter((g) => g.startTime && sameDay(g.startTime, selDate));
-    const futures = all.filter((g) => !g.startTime && !g.isMatch);
+    const map = {};
+    for (const ev of all) {
+      map[ev.id] = computeStatus(ev, tab, now);
+    }
+    return map;
+  }, [events, tab, now]);
+
+  // Apply all filters
+  const { matchGroups, futureGroups, liveCount, upcomingCount } = useMemo(() => {
+    const all = events[tab] || [];
+
+    // 1. Hide finished
+    const notFinished = all.filter((g) => statusMap[g.id] !== "finished");
+
+    // 2. Apply tour filter (tennis only)
+    const tourFiltered = tab === "tennis" && tourFilter !== "all"
+      ? notFinished.filter((g) => g.tour === tourFilter)
+      : notFinished;
+
+    // 3. Count live/upcoming for badges (across all dates)
+    const liveAll = tourFiltered.filter((g) => statusMap[g.id] === "live");
+    const upcomingAll = tourFiltered.filter((g) => statusMap[g.id] === "upcoming");
+
+    // 4. Apply status filter + date filter
+    let matches = [];
+    let futures = [];
+    if (statusFilter === "live") {
+      matches = liveAll; // live ignores date
+    } else if (statusFilter === "upcoming") {
+      matches = upcomingAll.filter((g) => g.startTime && sameDay(g.startTime, selDate));
+    } else {
+      // "all" = live + upcoming for selected date, plus futures
+      matches = tourFiltered.filter((g) =>
+        g.startTime && sameDay(g.startTime, selDate) &&
+        (statusMap[g.id] === "live" || statusMap[g.id] === "upcoming")
+      );
+      futures = tourFiltered.filter((g) => !g.startTime && !g.isMatch);
+    }
+
     return {
-      matchGroups: groupByTournament(matchesForDate, true),
+      matchGroups: groupByTournament(matches, true),
       futureGroups: groupByTournament(futures, false),
+      liveCount: liveAll.length,
+      upcomingCount: upcomingAll.length,
     };
-  }, [events, tab, selDate]);
+  }, [events, tab, statusMap, statusFilter, tourFilter, selDate]);
 
   const totalMatches = matchGroups.reduce((s, g) => s + g.events.length, 0);
   const totalFutures = futureGroups.reduce((s, g) => s + g.events.length, 0);
-  const showDebug = typeof window !== "undefined" && localStorage.getItem("debug");
 
   return (
     <>
@@ -406,7 +481,38 @@ export default function App() {
           ))}
         </nav>
 
-        <DateBar dates={dates} selected={selDate} onSelect={setSelDate} />
+        {/* Tour sub-tabs (tennis only) */}
+        {tab === "tennis" && (
+          <div className="subtabs">
+            {[
+              { id: "all", label: "All" },
+              { id: "atp", label: "ATP" },
+              { id: "wta", label: "WTA" },
+            ].map((s) => (
+              <button key={s.id} className={`subtab${tourFilter === s.id ? " subtab-a" : ""}`} onClick={() => setTourFilter(s.id)}>
+                {s.label}
+              </button>
+            ))}
+          </div>
+        )}
+
+        {/* Status filter pills */}
+        <div className="status-bar">
+          <button className={`pill${statusFilter === "all" ? " pill-a" : ""}`} onClick={() => setStatusFilter("all")}>
+            All
+          </button>
+          <button className={`pill${statusFilter === "live" ? " pill-a pill-live" : ""}`} onClick={() => setStatusFilter("live")}>
+            <span className="pill-dot">●</span> Live {liveCount > 0 && <span className="pill-c">{liveCount}</span>}
+          </button>
+          <button className={`pill${statusFilter === "upcoming" ? " pill-a" : ""}`} onClick={() => setStatusFilter("upcoming")}>
+            Upcoming {upcomingCount > 0 && <span className="pill-c">{upcomingCount}</span>}
+          </button>
+        </div>
+
+        {/* Date picker (hidden when Live filter is on, since live ignores date) */}
+        {statusFilter !== "live" && (
+          <DateBar dates={dates} selected={selDate} onSelect={setSelDate} />
+        )}
 
         <main className="ct">
           {loading && (
@@ -420,41 +526,29 @@ export default function App() {
           {!loading && !error && totalMatches === 0 && totalFutures === 0 && (
             <div className="st">
               <span style={{ fontSize: 32 }}>{TABS.find((t) => t.id === tab)?.icon}</span>
-              <p>No markets for {fmtDay(selDate).toLowerCase()}.</p>
-              <p style={{ fontSize: 12, color: "#64748b" }}>Total loaded: {(events[tab] || []).length} events</p>
+              <p>
+                {statusFilter === "live"
+                  ? "No matches live right now."
+                  : statusFilter === "upcoming"
+                  ? `No upcoming matches on ${fmtDay(selDate).toLowerCase()}.`
+                  : `No markets for ${fmtDay(selDate).toLowerCase()}.`}
+              </p>
+              {tab === "tennis" && tourFilter !== "all" && (
+                <p style={{ fontSize: 12, color: "#64748b" }}>Try switching to All tour.</p>
+              )}
             </div>
           )}
 
-          {/* Matches: grouped by tournament, chronological within */}
           {matchGroups.map((g) => (
-            <TournamentSection key={"m-" + g.name} group={g} fmt={fmt} />
+            <TournamentSection key={"m-" + g.name} group={g} fmt={fmt} statusMap={statusMap} />
           ))}
 
-          {/* Futures: separated by a divider, then grouped by tournament */}
           {futureGroups.length > 0 && (
             <div className="div">FUTURES & OUTRIGHTS</div>
           )}
           {futureGroups.map((g) => (
-            <TournamentSection key={"f-" + g.name} group={g} fmt={fmt} />
+            <TournamentSection key={"f-" + g.name} group={g} fmt={fmt} statusMap={statusMap} />
           ))}
-
-          {showDebug && debug[tab] && (
-            <div className="dbg">
-              <div><b>DEBUG</b></div>
-              <div>Tab: {tab}</div>
-              <div>Tried slugs: {debug[tab].triedSlugs.join(", ")}</div>
-              <div>Success slug: {debug[tab].successSlug || "none"}</div>
-              <div>Raw events: {debug[tab].eventCount}</div>
-              <div>Parsed: {(events[tab] || []).length}</div>
-              <div>With startTime: {(events[tab] || []).filter(g => g.startTime).length}</div>
-              <div>Matches today: {totalMatches}</div>
-              <div>Futures: {totalFutures}</div>
-              <details><summary>Tournaments found</summary>
-                {[...new Set((events[tab] || []).map(g => g.tournament))].map((t, i) =>
-                  <div key={i} style={{ fontSize: 10 }}>· {t}</div>)}
-              </details>
-            </div>
-          )}
         </main>
       </div>
     </>
@@ -466,6 +560,7 @@ const CSS = `
 *{margin:0;padding:0;box-sizing:border-box}body{background:#0f1116}
 ::-webkit-scrollbar{width:4px;height:4px}::-webkit-scrollbar-thumb{background:#1e293b;border-radius:4px}
 .app{font-family:'DM Sans',sans-serif;background:#0f1116;color:#e2e8f0;min-height:100vh;max-width:680px;margin:0 auto}
+
 .hdr{display:flex;justify-content:space-between;align-items:center;padding:14px 16px;border-bottom:1px solid rgba(255,255,255,.06)}
 .hdr-l{display:flex;align-items:center;gap:8px}
 .hdr-r{display:flex;align-items:center;gap:8px}
@@ -476,10 +571,28 @@ const CSS = `
 .tog-a{background:rgba(34,197,94,.2);color:#22c55e}
 .ref{background:rgba(255,255,255,.06);border:none;color:#94a3b8;font-size:16px;padding:4px 8px;border-radius:6px;cursor:pointer}
 .ref:hover{color:#fff}
+
 .tabs{display:flex;border-bottom:1px solid rgba(255,255,255,.06)}
 .tab{flex:1;background:none;border:none;border-bottom:2px solid transparent;color:#64748b;font:600 13px/1 'DM Sans',sans-serif;padding:12px 8px;cursor:pointer;transition:all .2s}
 .tab:hover{color:#94a3b8}
 .tab-a{color:#22c55e;border-bottom-color:#22c55e;background:rgba(34,197,94,.04)}
+
+/* Tennis sub-tabs */
+.subtabs{display:flex;gap:6px;padding:10px 16px;border-bottom:1px solid rgba(255,255,255,.06);background:rgba(255,255,255,.015)}
+.subtab{background:rgba(255,255,255,.04);border:1px solid rgba(255,255,255,.06);color:#94a3b8;font:600 11px/1 'DM Sans',sans-serif;padding:6px 14px;border-radius:14px;cursor:pointer;letter-spacing:.5px;transition:all .15s}
+.subtab:hover{background:rgba(255,255,255,.08);color:#e2e8f0}
+.subtab-a{background:rgba(59,130,246,.18);border-color:rgba(59,130,246,.35);color:#60a5fa}
+
+/* Status filter pills */
+.status-bar{display:flex;gap:6px;padding:10px 16px;border-bottom:1px solid rgba(255,255,255,.06);background:rgba(255,255,255,.01)}
+.pill{display:flex;align-items:center;gap:5px;background:rgba(255,255,255,.04);border:1px solid rgba(255,255,255,.06);color:#94a3b8;font:600 11px/1 'DM Sans',sans-serif;padding:6px 12px;border-radius:14px;cursor:pointer;letter-spacing:.5px;transition:all .15s}
+.pill:hover{background:rgba(255,255,255,.08);color:#e2e8f0}
+.pill-a{background:rgba(34,197,94,.18);border-color:rgba(34,197,94,.35);color:#22c55e}
+.pill-live.pill-a{background:rgba(239,68,68,.18);border-color:rgba(239,68,68,.35);color:#f87171}
+.pill-dot{font-size:8px;color:#ef4444;animation:pulse 1.6s ease-in-out infinite}
+.pill-c{background:rgba(255,255,255,.1);color:#e2e8f0;font-size:9px;padding:1px 5px;border-radius:8px;margin-left:2px}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.4}}
+
 .dp{display:flex;gap:4px;padding:10px 12px;overflow-x:auto;border-bottom:1px solid rgba(255,255,255,.06);-webkit-overflow-scrolling:touch}
 .dp-b{display:flex;flex-direction:column;align-items:center;gap:2px;padding:6px 12px;border-radius:8px;border:1px solid rgba(255,255,255,.06);background:rgba(255,255,255,.02);cursor:pointer;min-width:72px;font-family:inherit;transition:all .15s}
 .dp-b:hover{background:rgba(255,255,255,.06)}
@@ -489,27 +602,30 @@ const CSS = `
 .dp-d{font-size:16px;font-weight:700;color:#e2e8f0}
 .dp-l{font-size:9px;color:#64748b;text-transform:uppercase;letter-spacing:.5px;white-space:nowrap}
 
-/* Tournament section header — Flashscore style */
 .sec{margin-bottom:2px}
 .sec-h{display:flex;align-items:center;gap:8px;padding:10px 16px 6px;background:linear-gradient(180deg,rgba(34,197,94,.06),rgba(255,255,255,.015));border-bottom:1px solid rgba(34,197,94,.15);border-top:1px solid rgba(255,255,255,.04)}
 .sec-t{font-size:12px;font-weight:700;color:#e2e8f0;letter-spacing:.3px;flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .sec-c{font-size:10px;font-weight:600;color:#22c55e;background:rgba(34,197,94,.15);padding:1px 6px;border-radius:10px}
 
-/* Big divider between Matches and Futures */
 .div{padding:14px 16px 8px;font-size:10px;font-weight:700;color:#475569;letter-spacing:1.5px;background:#0a0c12;border-top:1px solid rgba(255,255,255,.06)}
 
-.mr{display:flex;align-items:center;padding:10px 16px;gap:10px;border-bottom:1px solid rgba(255,255,255,.04);text-decoration:none;color:inherit;transition:background .15s}
+.mr{display:flex;align-items:center;padding:10px 16px;gap:10px;border-bottom:1px solid rgba(255,255,255,.04);text-decoration:none;color:inherit;transition:background .15s;position:relative}
 .mr:hover{background:rgba(255,255,255,.05)}
+.mr-live{background:rgba(239,68,68,.04)}
+.mr-live:hover{background:rgba(239,68,68,.08)}
 .mr-time{font-size:11px;font-weight:600;color:#64748b;min-width:42px;text-align:center}
+.live-dot{color:#ef4444;font-size:12px;animation:pulse 1.6s ease-in-out infinite}
 .mr-teams{flex:1;display:flex;flex-direction:column;gap:3px;min-width:0}
 .mr-tn{font-size:13px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .mr-odds{display:flex;gap:5px}
 .mr-vol{font-size:10px;font-weight:600;color:#475569;min-width:40px;text-align:right}
+
 .ob{display:flex;flex-direction:column;align-items:center;background:rgba(255,255,255,.05);border-radius:6px;padding:5px 8px;min-width:50px;gap:1px}
 .ob-f{background:rgba(34,197,94,.1);outline:1px solid rgba(34,197,94,.2)}
 .ob-l{font-size:9px;font-weight:700;color:#64748b;letter-spacing:.5px}
 .ob-v{font-size:13px;font-weight:700;color:#fff}
 .ob-p{font-size:9px;color:#64748b}
+
 .out{border-bottom:1px solid rgba(255,255,255,.04);padding-bottom:4px}
 .out-h{display:flex;justify-content:space-between;align-items:center;padding:10px 16px 6px;text-decoration:none;color:inherit}
 .out-t{font-size:13px;font-weight:600}
@@ -524,13 +640,13 @@ const CSS = `
 .out-p{font-size:11px;color:#64748b;width:38px;text-align:right}
 .sm{background:none;border:none;color:#3b82f6;font:600 11px/1 'DM Sans',sans-serif;padding:6px 16px 10px;cursor:pointer;width:100%;text-align:left}
 .sm:hover{color:#60a5fa}
+
 .st{display:flex;flex-direction:column;align-items:center;gap:10px;padding:50px 24px;color:#64748b;font-size:13px;text-align:center}
 .err{color:#f59e0b}
 .st p{margin:0;line-height:1.5}
 @keyframes spin{to{transform:rotate(360deg)}}
 .sp{width:22px;height:22px;border:2px solid rgba(255,255,255,.1);border-top-color:#22c55e;border-radius:50%;animation:spin .8s linear infinite}
-.dbg{padding:16px;font-size:11px;color:#64748b;background:rgba(255,255,255,.02);margin-top:20px;line-height:1.6;font-family:monospace}
-.dbg b{color:#22c55e}
+
 @media(max-width:480px){
   .ob{min-width:42px;padding:4px 6px}.ob-v{font-size:12px}
   .mr{padding:8px 12px;gap:6px}.sub{display:none}
