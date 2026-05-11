@@ -15,16 +15,16 @@ async function api(path, params = {}) {
   return r.json();
 }
 
-/* ─── SPORT TABS ──
-   trySlugs: known Polymarket tag slugs to try (in order). First match wins.
-*/
 const TABS = [
   { id: "basketball", label: "🏀 NBA", icon: "🏀",
-    trySlugs: ["nba", "basketball", "nba-finals", "nba-playoffs"] },
+    trySlugs: ["nba", "basketball", "nba-finals", "nba-playoffs"],
+    defaultTournament: "NBA" },
   { id: "soccer", label: "⚽ Football", icon: "⚽",
-    trySlugs: ["fifa-world-cup-2026", "fifa-world-cup", "soccer", "football", "world-cup"] },
+    trySlugs: ["fifa-world-cup-2026", "fifa-world-cup", "soccer", "football", "world-cup"],
+    defaultTournament: "Football" },
   { id: "tennis", label: "🎾 Tennis", icon: "🎾",
-    trySlugs: ["tennis", "atp", "wta", "roland-garros", "wimbledon"] },
+    trySlugs: ["tennis", "atp", "wta", "roland-garros", "wimbledon"],
+    defaultTournament: "Tennis" },
 ];
 
 /* ─── HELPERS ─── */
@@ -65,62 +65,126 @@ function sameDay(d1, d2) {
     d1.getDate() === d2.getDate();
 }
 
+/* Strip "Tournament: " prefix from a label if present */
+function stripPrefix(label, prefix) {
+  if (!label || !prefix) return label;
+  const p = `${prefix}:`;
+  if (label.toLowerCase().startsWith(p.toLowerCase())) {
+    return label.slice(p.length).trim();
+  }
+  return label;
+}
+
+/* Extract tournament and match title from full event title */
+function extractTournament(fullTitle, sportDefault) {
+  // Look for "Tournament Name: rest of title" pattern
+  const m = fullTitle.match(/^([^:]+?):\s+(.+)$/);
+  if (m) {
+    const candidate = m[1].trim();
+    // Sanity check: tournament name should be relatively short and not contain "vs"
+    if (candidate.length < 80 && !/\bvs?\.?\b/i.test(candidate)) {
+      return { tournament: candidate, matchTitle: m[2].trim() };
+    }
+  }
+  return { tournament: sportDefault, matchTitle: fullTitle };
+}
+
 /* ─── PARSE EVENTS ─── */
-function parseEvents(rawEvents) {
-  const games = [];
+function parseEvent(ev, sportDefault) {
+  const markets = ev.markets || [];
+  if (!markets.length) return null;
 
-  for (const ev of rawEvents) {
-    const markets = ev.markets || [];
-    if (!markets.length) continue;
+  const fullTitle = ev.title || "";
+  const slug = ev.slug || "";
 
-    const title = ev.title || "";
-    const slug = ev.slug || "";
-    const vs = title.match(/^(.+?)\s+(?:vs\.?|v\.?)\s+(.+?)$/i);
+  // Extract tournament & cleaned match title
+  const { tournament, matchTitle } = extractTournament(fullTitle, sportDefault);
 
-    let startTime = null;
-    for (const m of markets) {
-      const t = m.gameStartTime || m.eventStartTime || null;
-      if (t) { startTime = new Date(t); break; }
-    }
-    if (!startTime && ev.startTime) startTime = new Date(ev.startTime);
-    if (!startTime && ev.startDate) startTime = new Date(ev.startDate);
+  // Detect "Team1 vs Team2" within the cleaned match title
+  const vs = matchTitle.match(/^(.+?)\s+(?:vs\.?|v\.?)\s+(.+?)$/i);
 
-    const moneyline = markets.find((m) => m.sportsMarketType === "moneyline" || (!m.sportsMarketType && vs));
+  // Game start time
+  let startTime = null;
+  for (const m of markets) {
+    const t = m.gameStartTime || m.eventStartTime || null;
+    if (t) { startTime = new Date(t); break; }
+  }
+  if (!startTime && ev.startTime) startTime = new Date(ev.startTime);
+  if (!startTime && ev.startDate) startTime = new Date(ev.startDate);
 
-    let outcomes = [];
-    const src = moneyline || markets[0];
-    if (src) {
+  // Parse outcomes (cleaning labels of tournament prefix)
+  const moneyline = markets.find((m) => m.sportsMarketType === "moneyline" || (!m.sportsMarketType && vs));
+  let outcomes = [];
+  const src = moneyline || markets[0];
+  if (src) {
+    try {
+      const prices = src.outcomePrices ? JSON.parse(src.outcomePrices) : [];
+      const labels = src.outcomes ? JSON.parse(src.outcomes) : [];
+      outcomes = labels.map((l, i) => ({
+        label: stripPrefix(l, tournament),
+        prob: parseFloat(prices[i] || 0),
+      }));
+    } catch (_) {}
+  }
+
+  if (!vs && markets.length > 1) {
+    outcomes = markets.filter((m) => m.outcomePrices).map((m) => {
       try {
-        const prices = src.outcomePrices ? JSON.parse(src.outcomePrices) : [];
-        const labels = src.outcomes ? JSON.parse(src.outcomes) : [];
-        outcomes = labels.map((l, i) => ({ label: l, prob: parseFloat(prices[i] || 0) }));
-      } catch (_) {}
-    }
+        const p = JSON.parse(m.outcomePrices);
+        const l = m.outcomes ? JSON.parse(m.outcomes) : [];
+        return {
+          label: stripPrefix(l[0] || m.groupItemTitle || "?", tournament),
+          prob: parseFloat(p[0] || 0),
+        };
+      } catch { return null; }
+    }).filter(Boolean).sort((a, b) => b.prob - a.prob);
+  }
 
-    if (!vs && markets.length > 1) {
-      outcomes = markets.filter((m) => m.outcomePrices).map((m) => {
-        try {
-          const p = JSON.parse(m.outcomePrices);
-          const l = m.outcomes ? JSON.parse(m.outcomes) : [];
-          return { label: l[0] || m.groupItemTitle || "?", prob: parseFloat(p[0] || 0) };
-        } catch { return null; }
-      }).filter(Boolean).sort((a, b) => b.prob - a.prob);
-    }
+  if (!outcomes.length) return null;
 
-    if (!outcomes.length) continue;
+  return {
+    id: ev.id,
+    title: fullTitle,
+    matchTitle,
+    tournament,
+    slug,
+    isMatch: !!vs,
+    team1: vs ? stripPrefix(vs[1].trim(), tournament) : null,
+    team2: vs ? vs[2].trim() : null,
+    outcomes,
+    volume: ev.volume || 0,
+    startTime,
+    url: link(slug),
+  };
+}
 
-    games.push({
-      id: ev.id, title, slug,
-      isMatch: !!vs,
-      team1: vs ? vs[1].trim() : null,
-      team2: vs ? vs[2].trim() : null,
-      outcomes,
-      volume: ev.volume || 0,
-      startTime,
-      url: link(slug),
+/* Group events by tournament. Sort groups by total volume desc, events within by startTime asc */
+function groupByTournament(events, chronological = true) {
+  const map = new Map();
+  for (const ev of events) {
+    const key = ev.tournament || "Other";
+    if (!map.has(key)) map.set(key, []);
+    map.get(key).push(ev);
+  }
+
+  // Sort each group
+  for (const [, evs] of map) {
+    evs.sort((a, b) => {
+      if (chronological && a.startTime && b.startTime) return a.startTime - b.startTime;
+      if (a.startTime && !b.startTime) return -1;
+      if (!a.startTime && b.startTime) return 1;
+      return parseFloat(b.volume) - parseFloat(a.volume);
     });
   }
-  return games;
+
+  // Sort groups by total volume desc
+  return Array.from(map.entries())
+    .map(([name, evs]) => ({
+      name,
+      events: evs,
+      totalVolume: evs.reduce((s, e) => s + parseFloat(e.volume || 0), 0),
+    }))
+    .sort((a, b) => b.totalVolume - a.totalVolume);
 }
 
 /* ─── COMPONENTS ─── */
@@ -184,11 +248,12 @@ function GameRow({ g, fmt }) {
     );
   }
 
+  // Outright / future — display matchTitle (without tournament prefix since shown in group header)
   const shown = exp ? g.outcomes : g.outcomes.slice(0, 5);
   return (
     <div className="out">
       <a href={g.url} target="_blank" rel="noopener noreferrer" className="out-h">
-        <span className="out-t">{g.title}</span>
+        <span className="out-t">{g.matchTitle}</span>
         <span className="vt">{fv(g.volume)}</span>
       </a>
       <div className="out-g">
@@ -215,6 +280,20 @@ function GameRow({ g, fmt }) {
   );
 }
 
+function TournamentSection({ group, fmt }) {
+  return (
+    <section className="sec">
+      <div className="sec-h">
+        <span className="sec-t">{group.name}</span>
+        <span className="sec-c">{group.events.length}</span>
+      </div>
+      {group.events.map((ev) => (
+        <GameRow key={ev.id} g={ev} fmt={fmt} />
+      ))}
+    </section>
+  );
+}
+
 /* ─── MAIN APP ─── */
 export default function App() {
   const [tab, setTab] = useState("basketball");
@@ -237,7 +316,6 @@ export default function App() {
       let rawEvents = [];
       const seen = new Set();
 
-      // Try each slug until we get events
       for (const slug of cfg.trySlugs) {
         debugInfo.triedSlugs.push(slug);
         try {
@@ -265,18 +343,14 @@ export default function App() {
       setDebug((prev) => ({ ...prev, [sportId]: debugInfo }));
 
       if (rawEvents.length === 0) {
-        setError(`No events returned for ${cfg.label}. Tried slugs: ${debugInfo.triedSlugs.join(", ")}`);
+        setError(`No events returned for ${cfg.label}.`);
         setEvents((p) => ({ ...p, [sportId]: [] }));
         return;
       }
 
-      const parsed = parseEvents(rawEvents);
-      parsed.sort((a, b) => {
-        if (a.startTime && b.startTime) return a.startTime - b.startTime;
-        if (a.startTime) return -1;
-        if (b.startTime) return 1;
-        return parseFloat(b.volume) - parseFloat(a.volume);
-      });
+      const parsed = rawEvents
+        .map((ev) => parseEvent(ev, cfg.defaultTournament))
+        .filter(Boolean);
 
       setEvents((prev) => ({ ...prev, [sportId]: parsed }));
     } catch (e) {
@@ -290,14 +364,19 @@ export default function App() {
     loadSport(tab);
   }, [tab, loadSport]);
 
-  const filtered = useMemo(() => {
+  /* Filter by date, then group by tournament */
+  const { matchGroups, futureGroups } = useMemo(() => {
     const all = events[tab] || [];
-    const withDate = all.filter((g) => g.startTime && sameDay(g.startTime, selDate));
+    const matchesForDate = all.filter((g) => g.startTime && sameDay(g.startTime, selDate));
     const futures = all.filter((g) => !g.startTime && !g.isMatch);
-    return { matches: withDate, futures };
+    return {
+      matchGroups: groupByTournament(matchesForDate, true),
+      futureGroups: groupByTournament(futures, false),
+    };
   }, [events, tab, selDate]);
 
-  const totalForDate = filtered.matches.length;
+  const totalMatches = matchGroups.reduce((s, g) => s + g.events.length, 0);
+  const totalFutures = futureGroups.reduce((s, g) => s + g.events.length, 0);
   const showDebug = typeof window !== "undefined" && localStorage.getItem("debug");
 
   return (
@@ -335,14 +414,10 @@ export default function App() {
           )}
 
           {error && (
-            <div className="st err">
-              ⚠️
-              <p>{error}</p>
-              <p style={{ fontSize: 11, color: "#64748b" }}>Open the browser console for details.</p>
-            </div>
+            <div className="st err">⚠️<p>{error}</p></div>
           )}
 
-          {!loading && !error && totalForDate === 0 && filtered.futures.length === 0 && (
+          {!loading && !error && totalMatches === 0 && totalFutures === 0 && (
             <div className="st">
               <span style={{ fontSize: 32 }}>{TABS.find((t) => t.id === tab)?.icon}</span>
               <p>No markets for {fmtDay(selDate).toLowerCase()}.</p>
@@ -350,29 +425,18 @@ export default function App() {
             </div>
           )}
 
-          {totalForDate > 0 && (
-            <section className="sec">
-              <div className="sec-h">
-                <span className="sec-t">GAMES · {fmtDay(selDate).toUpperCase()}</span>
-                <span className="sec-c">{totalForDate}</span>
-              </div>
-              {filtered.matches.map((g) => (
-                <GameRow key={g.id} g={g} fmt={fmt} />
-              ))}
-            </section>
-          )}
+          {/* Matches: grouped by tournament, chronological within */}
+          {matchGroups.map((g) => (
+            <TournamentSection key={"m-" + g.name} group={g} fmt={fmt} />
+          ))}
 
-          {filtered.futures.length > 0 && (
-            <section className="sec">
-              <div className="sec-h">
-                <span className="sec-t">FUTURES & OUTRIGHTS</span>
-                <span className="sec-c">{filtered.futures.length}</span>
-              </div>
-              {filtered.futures.map((g) => (
-                <GameRow key={g.id} g={g} fmt={fmt} />
-              ))}
-            </section>
+          {/* Futures: separated by a divider, then grouped by tournament */}
+          {futureGroups.length > 0 && (
+            <div className="div">FUTURES & OUTRIGHTS</div>
           )}
+          {futureGroups.map((g) => (
+            <TournamentSection key={"f-" + g.name} group={g} fmt={fmt} />
+          ))}
 
           {showDebug && debug[tab] && (
             <div className="dbg">
@@ -383,10 +447,11 @@ export default function App() {
               <div>Raw events: {debug[tab].eventCount}</div>
               <div>Parsed: {(events[tab] || []).length}</div>
               <div>With startTime: {(events[tab] || []).filter(g => g.startTime).length}</div>
-              <div>Matches: {(events[tab] || []).filter(g => g.isMatch).length}</div>
-              <div>Filtered (date): {totalForDate}</div>
-              <details><summary>Sample event titles</summary>
-                {(events[tab] || []).slice(0, 10).map(g => <div key={g.id} style={{ fontSize: 10 }}>· {g.title} {g.startTime ? `(${g.startTime.toISOString()})` : "(no time)"}</div>)}
+              <div>Matches today: {totalMatches}</div>
+              <div>Futures: {totalFutures}</div>
+              <details><summary>Tournaments found</summary>
+                {[...new Set((events[tab] || []).map(g => g.tournament))].map((t, i) =>
+                  <div key={i} style={{ fontSize: 10 }}>· {t}</div>)}
               </details>
             </div>
           )}
@@ -423,10 +488,16 @@ const CSS = `
 .dp-a .dp-l{color:#22c55e}
 .dp-d{font-size:16px;font-weight:700;color:#e2e8f0}
 .dp-l{font-size:9px;color:#64748b;text-transform:uppercase;letter-spacing:.5px;white-space:nowrap}
-.sec{margin-bottom:4px}
-.sec-h{display:flex;align-items:center;gap:8px;padding:10px 16px 6px;background:rgba(255,255,255,.015)}
-.sec-t{font-size:11px;font-weight:700;color:#64748b;letter-spacing:1px}
+
+/* Tournament section header — Flashscore style */
+.sec{margin-bottom:2px}
+.sec-h{display:flex;align-items:center;gap:8px;padding:10px 16px 6px;background:linear-gradient(180deg,rgba(34,197,94,.06),rgba(255,255,255,.015));border-bottom:1px solid rgba(34,197,94,.15);border-top:1px solid rgba(255,255,255,.04)}
+.sec-t{font-size:12px;font-weight:700;color:#e2e8f0;letter-spacing:.3px;flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .sec-c{font-size:10px;font-weight:600;color:#22c55e;background:rgba(34,197,94,.15);padding:1px 6px;border-radius:10px}
+
+/* Big divider between Matches and Futures */
+.div{padding:14px 16px 8px;font-size:10px;font-weight:700;color:#475569;letter-spacing:1.5px;background:#0a0c12;border-top:1px solid rgba(255,255,255,.06)}
+
 .mr{display:flex;align-items:center;padding:10px 16px;gap:10px;border-bottom:1px solid rgba(255,255,255,.04);text-decoration:none;color:inherit;transition:background .15s}
 .mr:hover{background:rgba(255,255,255,.05)}
 .mr-time{font-size:11px;font-weight:600;color:#64748b;min-width:42px;text-align:center}
