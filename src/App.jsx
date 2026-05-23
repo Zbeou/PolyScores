@@ -32,9 +32,48 @@ const TABS = [
     trySlugs: ["fifa-world-cup-2026", "fifa-world-cup", "soccer", "football", "world-cup"],
     defaultTournament: "Football" },
   { id: "tennis", label: "🎾 Tennis", icon: "🎾",
-    trySlugs: ["tennis", "atp", "wta", "roland-garros", "wimbledon"],
+    trySlugs: ["tennis", "atp", "wta"],
     defaultTournament: "Tennis" },
 ];
+
+/* ─── Known ATP / WTA tournament name patterns (case-insensitive) ─── */
+const ATP_TOURNAMENTS = [
+  // Grand Slams (men's draws)
+  "australian open men", "us open men", "french open men", "wimbledon men",
+  // Masters 1000
+  "indian wells", "miami open", "monte.carlo", "madrid open", "italian open", "internazionali bnl",
+  "canadian open", "rogers cup", "cincinnati", "shanghai", "paris masters", "atp finals",
+  // ATP 500/250 (frequent)
+  "geneva open", "gonet geneva", "hamburg open", "lyon open", "open parc",
+  "barcelona open", "estoril", "munich", "rotterdam", "marseille", "dubai duty",
+  "acapulco", "rio open", "buenos aires", "santiago", "houston", "queens",
+  "halle", "stuttgart", "eastbourne men", "newport", "umag", "kitzbuhel",
+  "winston-salem", "metz", "sofia", "antwerp", "stockholm", "moscow atp",
+  "vienna", "basel", "tokyo atp", "next gen",
+];
+
+const WTA_TOURNAMENTS = [
+  // Grand Slams (women's draws)
+  "australian open women", "us open women", "french open women", "wimbledon women",
+  // WTA 1000
+  "dubai", "doha", "indian wells women", "miami open women", "madrid open women",
+  "italian open women", "internazionali bnl d'italia women", "rome wta",
+  // WTA 500/250 (frequent)
+  "strasbourg", "internationaux de strasbourg",
+  "rabat", "lalla meryem", "morocco open",
+  "abu dhabi", "adelaide", "auckland", "hobart",
+  "san diego", "merida", "linz", "cluj", "cleveland",
+  "guadalajara", "monterrey", "bogota", "charleston",
+  "stuttgart wta", "ningbo", "tokyo wta", "osaka wta", "guangzhou", "zhengzhou",
+  "tashkent", "seoul wta", "chennai", "hua hin",
+];
+
+/* Generic markers that strongly suggest WTA or ATP */
+const WTA_HINTS = [/\bwta\b/i, /\bwomen'?s?\b/i, /lalla meryem/i, /strasbourg/i, /\bladies\b/i];
+const ATP_HINTS = [/\batp\b/i, /\bmen'?s?\b/i, /geneva open/i, /hamburg open/i, /\bgents\b/i];
+
+/* Known ITF / Challenger markers — for exclusion when filtering */
+const ITF_HINTS = [/\bitf\b/i, /\bchallenger\b/i, /\bm15\b/i, /\bm25\b/i, /\bw15\b/i, /\bw25\b/i, /\bw35\b/i, /\bm50\b/i, /\bw50\b/i];
 
 /* ─── HELPERS ─── */
 const d2o = (p) => (!p || p <= 0 ? "-" : (1 / p).toFixed(2));
@@ -94,17 +133,36 @@ function extractTournament(fullTitle, sportDefault) {
   return { tournament: sportDefault, matchTitle: fullTitle };
 }
 
-function detectTour(rawEvent, parsedTags) {
-  const allTagSlugs = parsedTags.map((t) => t.toLowerCase());
-  if (allTagSlugs.some((t) => t === "atp" || t.includes("atp-"))) return "atp";
-  if (allTagSlugs.some((t) => t === "wta" || t.includes("wta-"))) return "wta";
-  const t = (rawEvent.title || "").toLowerCase();
-  if (/\b(atp|men'?s)\b/.test(t)) return "atp";
-  if (/\b(wta|women'?s)\b/.test(t)) return "wta";
+/* ─── ATP / WTA detection — multi-signal ─── */
+function detectTour(rawEvent, parsedTags, tournament) {
+  const tagsLower = parsedTags.map((t) => (t || "").toLowerCase());
+  const title = (rawEvent.title || "").toLowerCase();
   const series = (rawEvent.seriesSlug || "").toLowerCase();
-  if (series.includes("atp")) return "atp";
-  if (series.includes("wta")) return "wta";
+  const tour = (tournament || "").toLowerCase();
+  const haystack = `${tour} ${title} ${series}`;
+
+  // 1. Explicit ATP/WTA tag
+  if (tagsLower.some((t) => t === "atp" || t.startsWith("atp-") || t.endsWith("-atp"))) return "atp";
+  if (tagsLower.some((t) => t === "wta" || t.startsWith("wta-") || t.endsWith("-wta"))) return "wta";
+
+  // 2. Known tournament name match (most reliable for finals)
+  for (const t of WTA_TOURNAMENTS) {
+    if (haystack.includes(t)) return "wta";
+  }
+  for (const t of ATP_TOURNAMENTS) {
+    if (haystack.includes(t)) return "atp";
+  }
+
+  // 3. Generic hints
+  if (WTA_HINTS.some((re) => re.test(haystack))) return "wta";
+  if (ATP_HINTS.some((re) => re.test(haystack))) return "atp";
+
   return "unknown";
+}
+
+function isITF(rawEvent, tournament) {
+  const haystack = `${(tournament || "").toLowerCase()} ${(rawEvent.title || "").toLowerCase()}`;
+  return ITF_HINTS.some((re) => re.test(haystack));
 }
 
 /* ─── PARSE EVENTS ─── */
@@ -155,7 +213,9 @@ function parseEvent(ev, sportDefault, sportId) {
     ...(ev.tags || []).map((t) => t.slug || t.label || ""),
     ...markets.flatMap((m) => (m.tags || []).map((t) => t.slug || t.label || "")),
   ].filter(Boolean);
-  const tour = sportId === "tennis" ? detectTour(ev, tagSlugs) : null;
+
+  const tour = sportId === "tennis" ? detectTour(ev, tagSlugs, tournament) : null;
+  const itf = sportId === "tennis" ? isITF(ev, tournament) : false;
 
   return {
     id: ev.id, title: fullTitle, matchTitle, tournament, slug,
@@ -164,7 +224,7 @@ function parseEvent(ev, sportDefault, sportId) {
     team2: vs ? vs[2].trim() : null,
     outcomes,
     volume: ev.volume || 0,
-    startTime, tour, tagSlugs,
+    startTime, tour, itf, tagSlugs,
     sportId,
     url: link(slug),
   };
@@ -363,7 +423,6 @@ export default function App() {
 
   const dates = useMemo(buildDates, []);
 
-  // Persist favorites
   useEffect(() => {
     if (typeof window === "undefined") return;
     localStorage.setItem(FAV_KEY, JSON.stringify([...favorites]));
@@ -377,10 +436,31 @@ export default function App() {
     });
   }, []);
 
-  // Live status refresh
   useEffect(() => {
     const id = setInterval(() => setNow(new Date()), 30_000);
     return () => clearInterval(id);
+  }, []);
+
+  /* ─── PAGINATED FETCH ─── */
+  const fetchSlugPaginated = useCallback(async (slug, options) => {
+    const pageSize = 200;
+    const maxPages = 5; // up to 1000 events per slug
+    const collected = [];
+    for (let page = 0; page < maxPages; page++) {
+      try {
+        const data = await api("/events", {
+          ...options,
+          tag_slug: slug,
+          related_tags: "true",
+          limit: String(pageSize),
+          offset: String(page * pageSize),
+        });
+        if (!Array.isArray(data) || data.length === 0) break;
+        collected.push(...data);
+        if (data.length < pageSize) break;
+      } catch (_) { break; }
+    }
+    return collected;
   }, []);
 
   const loadSport = useCallback(async (sportId) => {
@@ -388,39 +468,34 @@ export default function App() {
     const cfg = TABS.find((t) => t.id === sportId);
     if (!cfg) return;
     try {
-      let rawEvents = [];
       const seen = new Set();
+      const rawEvents = [];
 
-      // 1. Open events (upcoming + live)
+      // 1) Open events sorted by startDate ascending (gets imminent matches first)
       for (const slug of cfg.trySlugs) {
-        try {
-          const data = await api("/events", {
-            tag_slug: slug, related_tags: "true",
-            active: "true", closed: "false",
-            limit: "200", order: "volume_24hr", ascending: "false",
-          });
-          if (Array.isArray(data)) {
-            for (const ev of data) {
-              if (!seen.has(ev.id)) { seen.add(ev.id); rawEvents.push(ev); }
-            }
-          }
-        } catch (_) {}
+        const arr = await fetchSlugPaginated(slug, {
+          active: "true",
+          closed: "false",
+          order: "startDate",
+          ascending: "true",
+        });
+        for (const ev of arr) {
+          if (!seen.has(ev.id)) { seen.add(ev.id); rawEvents.push(ev); }
+        }
       }
 
-      // 2. Recently closed events (for finished matches)
+      // 2) Recently closed events (for finished matches display)
       for (const slug of cfg.trySlugs) {
-        try {
-          const data = await api("/events", {
-            tag_slug: slug, related_tags: "true",
-            closed: "true", archived: "false",
-            limit: "50", order: "endDate", ascending: "false",
-          });
-          if (Array.isArray(data)) {
-            for (const ev of data) {
-              if (!seen.has(ev.id)) { seen.add(ev.id); rawEvents.push(ev); }
-            }
-          }
-        } catch (_) {}
+        const arr = await fetchSlugPaginated(slug, {
+          closed: "true",
+          archived: "false",
+          order: "endDate",
+          ascending: "false",
+        });
+        // Only keep the first 50 most recent per slug
+        for (const ev of arr.slice(0, 50)) {
+          if (!seen.has(ev.id)) { seen.add(ev.id); rawEvents.push(ev); }
+        }
       }
 
       if (rawEvents.length === 0) {
@@ -433,7 +508,7 @@ export default function App() {
         .map((ev) => parseEvent(ev, cfg.defaultTournament, sportId))
         .filter(Boolean);
 
-      // Filter out very old events (start date > 2 days ago for non-future ones)
+      // Filter out very old events
       const cutoff = Date.now() - 2.5 * 86400_000;
       const cleaned = parsed.filter((e) =>
         !e.startTime || e.startTime.getTime() >= cutoff || !e.isMatch
@@ -445,14 +520,13 @@ export default function App() {
     } finally {
       setLoading(false);
     }
-  }, []);
+  }, [fetchSlugPaginated]);
 
   useEffect(() => {
     loadSport(tab);
     setTourFilter("all");
   }, [tab, loadSport]);
 
-  // Load all sports when entering favorites view (to show all favorites)
   useEffect(() => {
     if (!favoritesView) return;
     for (const t of TABS) {
@@ -470,7 +544,6 @@ export default function App() {
   }, [events, tab, now, favoritesView]);
 
   const { matchGroups, futureGroups, liveCount } = useMemo(() => {
-    // FAVORITES VIEW: show all favorited events across all sports, no date filter
     if (favoritesView) {
       const allEvents = Object.values(events).flat();
       const favEvents = allEvents.filter((e) => favorites.has(e.id));
@@ -499,7 +572,6 @@ export default function App() {
         g.startTime && sameDay(g.startTime, selDate) && statusMap[g.id] === "upcoming"
       );
     } else {
-      // All: ALL matches for selected date (finished + live + upcoming)
       matches = tourFiltered.filter((g) =>
         g.startTime && sameDay(g.startTime, selDate)
       );
@@ -551,7 +623,6 @@ export default function App() {
           </div>
         </header>
 
-        {/* Sport tabs hidden in favorites view */}
         {!favoritesView && (
           <nav className="tabs">
             {TABS.map((t) => (
@@ -572,7 +643,6 @@ export default function App() {
           </div>
         )}
 
-        {/* Status pills hidden in favorites view */}
         {!favoritesView && (
           <div className="status-bar">
             <button className={`pill${statusFilter === "all" ? " pill-a" : ""}`} onClick={() => setStatusFilter("all")}>All</button>
@@ -583,12 +653,10 @@ export default function App() {
           </div>
         )}
 
-        {/* Date bar hidden in favorites view + when live filter is active */}
         {!favoritesView && statusFilter !== "live" && (
           <DateBar dates={dates} selected={selDate} onSelect={setSelDate} />
         )}
 
-        {/* Favorites view banner */}
         {favoritesView && (
           <div className="fav-banner">
             <span>★ Your favorite matches</span>
